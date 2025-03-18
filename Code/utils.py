@@ -197,8 +197,8 @@ class GraphNN(torch.nn.Module):
 class TimeoutException(Exception):
     pass
 
-def sample_with_timeout(posterior_ensemble, data_list, n_samples, device, timeout_sec):
-    samples = np.zeros((n_samples, len(data_list), len(data_list[0].y)))
+def sample_with_timeout(posterior_ensemble, data_list, n_samples, device, timeout_sec, ndims):
+    samples = np.zeros((n_samples, len(data_list), ndims))
 
     def timeout_handler(signum, frame):
         raise TimeoutException

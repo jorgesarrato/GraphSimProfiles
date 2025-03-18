@@ -54,7 +54,7 @@ device = accelerator.device
 
 Nstars = args.N_stars
 
-N_proj_per_gal = 64
+N_proj_per_gal = 8
 
 stellar_features = {
     'positions': [],
@@ -184,7 +184,7 @@ for i in tqdm(range(len(labels))):
 		velocities=stellar_features['velocities'][i],
 		labels=labels[i],
 	)
-	data.hlr = torch.tensor(torch.quantile(data.x[:,0], 0.5), dtype = torch.float32).reshape((1,1))
+	data.hlr = torch.tensor(torch.quantile(10**data.x[:,0], 0.5), dtype = torch.float32).reshape((1,1))
 	data.std = torch.tensor(torch.std(data.x[:,1]), dtype = torch.float32).reshape((1,1))
 	stds.append(float(data.std.numpy()))
 	hlrs.append(float(data.hlr.numpy()))
@@ -309,8 +309,8 @@ elif args.GraphNN_type == 'GAT':
 # define training arguments
 train_args = {
     'training_batch_size': 64,
-    'learning_rate': 5e-4,
-    'stop_after_epochs': 20,
+    'learning_rate': 4e-4,
+    'stop_after_epochs': 10,
     'max_epochs': 500
 }
 
@@ -356,18 +356,18 @@ n_sec = n_min * 60  # Convert minutes to seconds
 
 if args.mode in ['train', 'sample']:
     print('Sampling Training Set')
-    samples_train = sample_with_timeout(posterior_ensemble, train_data_list, N_samples, device, n_sec)
+    samples_train = sample_with_timeout(posterior_ensemble, train_data_list, N_samples, device, n_sec, 38)
     np.save(model_folder + '/samples_train', samples_train)
 
     print('Sampling Validation Set')
-    samples_val = sample_with_timeout(posterior_ensemble, val_data_list, N_samples, device, n_sec)
+    samples_val = sample_with_timeout(posterior_ensemble, val_data_list, N_samples, device, n_sec, 38)
     np.save(model_folder + '/samples_val', samples_val)
 else:
     samples_train = np.load(model_folder + '/samples_train.npy')
     samples_val = np.load(model_folder + '/samples_val.npy')
 
 print('Sampling Test Set')
-samples_test = sample_with_timeout(posterior_ensemble, data_list_test, N_samples, device, n_sec)
+samples_test = sample_with_timeout(posterior_ensemble, data_list_test, N_samples, device, n_sec, 38)
 np.save(model_folder + '/samples_test.npy', samples_test)
 
 xmed = [-0.3765142150803461, -0.32533992583436344, -0.25339925834363414, -0.22224969097651423, -0.1473423980222497, -0.09320148331273177, -0.056860321384425205, 0.04029666254635353, 0.12484548825710756, 0.21384425216316444, 0.26872682323856617, 0.34956736711990116, 0.42076637824474666, 0.4912237330037083, 0.5305315203955501]
@@ -385,20 +385,20 @@ xdown = np.array(xdown)
 
 
 
-truths_train = labels2[:train_size]
+truths_train = labels2[:train_and_val_size][train_mask]
 medians_train = 10**np.nanmedian(samples_train, axis = 0)/(10**truths_train)
 r_medians_train = np.nanmedian(medians_train, axis = 0)
 r_p16_train = np.nanpercentile(medians_train, 16, axis = 0)
 r_p84_train = np.nanpercentile(medians_train, 84, axis = 0)
 
 
-truths_val = labels2[train_size:train_and_val_size]
+truths_val = labels2[:train_and_val_size][val_mask]
 medians_val = 10**np.nanmedian(samples_val, axis = 0)/(10**truths_val)
 r_medians_val = np.nanmedian(medians_val, axis = 0)
 r_p16_val = np.nanpercentile(medians_val, 16, axis = 0)
 r_p84_val = np.nanpercentile(medians_val, 84, axis = 0)
 
-truths_test = labels2[train_and_val_size:train_and_val_size+len(data_list_test)]
+truths_test = labels2_test_filtered
 medians_test = 10**np.nanmedian(samples_test, axis = 0)/(10**truths_test)
 r_medians_test = np.nanmedian(medians_test, axis = 0)
 r_p16_test = np.nanpercentile(medians_test, 16, axis = 0)
