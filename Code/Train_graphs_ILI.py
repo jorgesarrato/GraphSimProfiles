@@ -35,6 +35,8 @@ parser.add_argument('test_long', type=int, choices=[0, 1], help='Test long flag 
 parser.add_argument('hlr_std', type=int, choices=[0, 1], help='Use pre-calculated hlr and std flag (0 or 1)')
 parser.add_argument('N_stars', type=int, help='Number of stars to be used for creating graphs')
 parser.add_argument('GraphNN_type', choices=['Cheb', 'GCN', 'GAT'])
+parser.add_argument('N_proj_per_gal', type = int, help = 'Number of projections per galaxy')
+
 
 args = parser.parse_args()
 
@@ -54,7 +56,7 @@ device = accelerator.device
 
 Nstars = args.N_stars
 
-N_proj_per_gal = 8
+N_proj_per_gal = args.N_proj_per_gal
 
 stellar_features = {
     'positions': [],
@@ -124,7 +126,7 @@ for i, file_name in enumerate(tqdm(existing_files)):
         posveldata = posvel[proj_idx]
         masses_idx = np.log10(masses[:-4, proj_idx])
             
-        estim_masses = np.array([masses[9, proj_idx], masses[-2, proj_idx], masses[16, proj_idx], masses[17, proj_idx], masses[17, proj_idx]])
+        estim_masses = np.array([masses[8, proj_idx], masses[-2, proj_idx], masses[15, proj_idx], masses[16, proj_idx], masses[16, proj_idx]])
           
         if np.any(np.isnan(posveldata)) or np.any(np.isinf(posveldata)):
             continue
@@ -235,7 +237,7 @@ def collate_fn(batch):
     return batch, batch.y
     
 main_file_folder = '/scratch/jsarrato/Wolf_for_FIRE/work/'
-Model_str = f'{args.GraphNN_type}_{sim}_poisson{Nstars}_Nfiles{len_train_files}_hlrstd{args.hlr_std}'
+Model_str = f'{args.GraphNN_type}_{sim}_poisson{Nstars}_Nfiles{len_train_files}_Nproj{N_proj_per_gal}_hlrstd{args.hlr_std}'
     
 model_folder = main_file_folder+'Graph+Flow_Mocks_NH/'+Model_str
 if not os.path.exists(model_folder):

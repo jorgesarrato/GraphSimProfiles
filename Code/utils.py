@@ -208,7 +208,11 @@ def sample_with_timeout(posterior_ensemble, data_list, n_samples, device, timeou
         signal.signal(signal.SIGALRM, timeout_handler)
         signal.alarm(timeout_sec)
         try:
-            samples[:, ii, :] = posterior_ensemble.sample((n_samples,), data_list[ii].to(device)).detach().cpu().numpy()
+            data = data_list[ii].to(device)  # Move data to GPU
+            sample = posterior_ensemble.sample((n_samples,), data)  # Perform computation on GPU
+            samples[:, ii, :] = sample.detach().cpu().numpy()  # Move result back to CPU
+            del data, sample  # Explicitly delete tensors to free GPU memory
+            #torch.cuda.empty_cache()
         except TimeoutException:
             print(f"Warning: Sampling for data point {ii} took longer than {timeout_sec // 60} minutes. Setting result to NaN.")
             samples[:, ii, :] = np.nan
