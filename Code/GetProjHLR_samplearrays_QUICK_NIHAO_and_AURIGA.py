@@ -125,8 +125,7 @@ count = n_project * startindex
 current_path = ''
 current_halo = ''
 
-stellar_quantities_to_save = ['age', 'HII', 'HeIII', 'hetot', 'hydrogen', 'ne', 'feh', 'ofe', 'u_mag', 'b_mag', 'v_mag', 'r_mag', 'i_mag', 'j_mag', 'h_mag', 'k_mag']
-
+stellar_quantities_to_save = ['age', 'H', 'Fe', 'O', 'u_mag', 'b_mag', 'v_mag', 'r_mag', 'i_mag', 'j_mag', 'h_mag', 'k_mag']
 
 r_array = np.arange(0.2,4,0.1)
 r_array = np.append(r_array,np.array([1.7])) # Amorisco & Evans
@@ -346,10 +345,34 @@ for i in range(startindex, endindex):
 
         stellar_quantities = np.zeros((len(stellar_quantities_to_save), n_stars))
         for j, quantity in enumerate(stellar_quantities_to_save):
-            stellar_quantities[j] = h1.s[quantity][indeces2]
+          if quantity == 'H':
+            try:
+              if 'halo' in galname:
+                stellar_quantities[j] = h1.s[quantity][indeces2]
+              else:
+                stellar_quantities[j] = h1.s['hydrogen'][indeces2]
+            except:
+               stellar_quantities[j] = np.nan*np.ones(n_stars)
+          elif quantity == 'Fe':
+            try:
+              if 'halo' in galname:
+                stellar_quantities[j] = h1.s[quantity][indeces2]
+              else:
+                stellar_quantities[j] = (10**h1.s['feh'][indeces2])*h1.s['hydrogen'][indeces2]
+            except:
+               stellar_quantities[j] = np.nan*np.ones(n_stars)
+          elif quantity == 'O':
+            try:
+              if 'halo' in galname:
+                stellar_quantities[j] = h1.s[quantity][indeces2]
+              else:
+                stellar_quantities[j] = (10**h1.s['ofe'][indeces2])*(10**h1.s['feh'][indeces2])*h1.s['hydrogen'][indeces2]
+            except:
+               stellar_quantities[j] = np.nan*np.ones(n_stars)
 
-        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/steallar_quantities{i}", stellar_quantities)
 
-        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/softenings{i}", np.array([min(h1.s['eps'][indeces2]), min(h1.d['eps'][indeces2])]))
+        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/stellar_quantities{i}", stellar_quantities)
+
+        #np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/softenings{i}", np.array([min(h1.s['eps'][indeces2]), min(h1.d['eps'][indeces2])]))
           
   n_projs_computed = 0
