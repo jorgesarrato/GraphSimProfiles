@@ -349,5 +349,7 @@ for i in range(startindex, endindex):
             stellar_quantities[j] = h1.s[quantity][indeces2]
 
         np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/steallar_quantities{i}", stellar_quantities)
+
+        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/softenings{i}", np.array([min(h1.s['eps'][indeces2]), min(h1.d['eps'][indeces2])]))
           
   n_projs_computed = 0
