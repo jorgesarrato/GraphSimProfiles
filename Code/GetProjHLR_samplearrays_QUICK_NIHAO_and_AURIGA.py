@@ -78,27 +78,6 @@ def half_light_r_count_XYZ(X,Y,Z, cylindrical=False):
             min_low_r = test_r
 
     return test_r
- 
-def get_ellip(h,f,X,Y,VZ, hlr_fracs_list):
-  m_arr_circ = np.zeros(len(hlr_fracs_list))
-  disp_arr_circ = np.zeros(len(hlr_fracs_list))
-
-
-  RXY = np.sqrt(X**2+Y**2)
-
-  # Loop over projected radii. Calculate mass and disp inside fitted ellipse isophotes and inside simple circles.
-  for kk,hlr in enumerate(hlr_fracs_list):
-    try:
-       m_arr_circ[kk] = f(hlr)
-    except:
-       print('Interpolation failed, switching to manual summatory or skipping',kk)
-       if kk != 11:
-          m_arr_circ[kk] = np.sum(h[h['r']<hlr]['mass'])
-
-    mean_vel_circ = np.nanmean(VZ[(RXY<hlr)])
-    disp_arr_circ[kk] = np.sqrt(np.nanmean((VZ[(RXY<hlr)] - mean_vel_circ)**2))
-
-  return m_arr_circ, disp_arr_circ
 	
 #################################################################################################
 # DEFINE WORKING PATH, READ DATA AND MASK IT
@@ -108,7 +87,6 @@ main_file_folder = '/scratch/jsarrato/Paper-GraphSimProfiles/work/'
 #main_file_folder = '/home/jorge/Physics/PhD/Paper3/Work/'
 
 gal_data = pd.read_csv(main_file_folder + 'file_labels_NIHAOandAURIGA_PCAfiltered.csv')
-
 
 """gal_data = gal_data[gal_data['name'].str.endswith('h1')]
 gal_data = gal_data.sort_values('m_r3').reset_index(drop = True)"""
@@ -147,6 +125,8 @@ count = n_project * startindex
 current_path = ''
 current_halo = ''
 
+stellar_quantities_to_save = ['age', 'HII', 'HeIII', 'hetot', 'hydrogen', 'ne', 'feh', 'ofe', 'u_mag', 'b_mag', 'v_mag', 'r_mag', 'i_mag', 'j_mag', 'h_mag', 'k_mag']
+
 
 r_array = np.arange(0.2,4,0.1)
 r_array = np.append(r_array,np.array([1.7])) # Amorisco & Evans
@@ -157,7 +137,7 @@ rheader_list = list(['r'+str(ii+1) for ii in range(np.size(r_array))])
 mrheader_list_circ = list(['m_r_circ'+str(ii+1) for ii in range(np.size(r_array))])
 dispsheader_list_circ = list(['disp_r_circ'+str(ii+1) for ii in range(np.size(r_array))])
 
-headers = ['path','name','i_index','count','angx','angy','angz']+rheader_list+mrheader_list_circ+dispsheader_list_circ
+headers = ['path','name','i_index','count','angx','angy','angz']
 
 print(main_file_folder + filename)
                     
@@ -268,11 +248,6 @@ for i in range(startindex, endindex):
 
   p = pynbody.analysis.profile.Profile(h1, rmin = 0.001, rmax = 150, ndim = 3, type = 'lin',nbins = 100000)
 
-  rs = p['rbins']
-
-  f = interp1d(rs,p['mass_enc'])
-
-
   try:
     indeces2 = np.random.choice(np.arange(0,len(h1.s['x'])), size = n_stars, replace = False)
   except:
@@ -325,13 +300,6 @@ for i in range(startindex, endindex):
 
           r_arr1 = hlr*r_array
 
-          try:
-            m_arr_circ, disp_arr_circ = get_ellip(h1,f,X[indeces2],Y[indeces2],VZ[indeces2], r_arr1)
-
-          except:
-            m_arr_circ = np.ones_like(r_array)*np.NaN
-            disp_arr_circ = np.ones_like(r_array)*np.NaN
-
           X = X[indeces2]
           Y = Y[indeces2]
           Z = Z[indeces2]
@@ -340,15 +308,13 @@ for i in range(startindex, endindex):
 
       else:
           r_arr1 = np.ones_like(r_array)*-9999
-          m_arr_circ = np.ones_like(r_array)*-9999
-          disp_arr_circ = np.ones_like(r_array)*-9999
 
 
           hfile = open(main_file_folder + '/Logs/'+galname+'_CenterError.dat','w')
           hfile.write(galname+'  '+str(halonum)+'  '+galpath+'  ')
           hfile.close()
 
-      gal_result = [galpath, galname_original ,i, count, x[project], y[project], z[project]]+list(r_arr1)+list(m_arr_circ)+list(disp_arr_circ)
+      gal_result = [galpath, galname_original ,i, count, x[project], y[project], z[project]]
       gal_dict = {headers[i]: [gal_result[i]] for i in range(len(headers))}
       gal_line = pd.DataFrame(gal_dict)
       new_gal_data = pd.concat([new_gal_data, gal_line])
@@ -372,12 +338,16 @@ for i in range(startindex, endindex):
         hlrstd_arr[0, project] = hlr
         hlrstd_arr[1, project] = np.std(np.array(VZ))
         
-        masses_arr[:,project] = m_arr_circ
+        torch.save(data_list, main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/posvel_{i}.pkl")
 
-        torch.save(data_list, main_file_folder+"arrs_NIHAO_and_AURIGA_PCAfilt_1000/posvel_"+str(i)+".pkl")
-
-        np.save(main_file_folder+"arrs_NIHAO_and_AURIGA_PCAfilt_1000/hlrstd_arr"+str(i), hlrstd_arr)
+        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/hlrstd_arr{i}", hlrstd_arr)
         
-        np.save(main_file_folder+"arrs_NIHAO_and_AURIGA_PCAfilt_1000/masses_arr"+str(i), masses_arr)
+        np.savez(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/mass_interp{i}.npz", x=p['rbins'], y=p['mass_enc'])
+
+        stellar_quantities = np.zeros((len(stellar_quantities_to_save), n_stars))
+        for j, quantity in enumerate(stellar_quantities_to_save):
+            stellar_quantities[j] = h1.s[quantity][indeces2]
+
+        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/steallar_quantities{i}", stellar_quantities)
           
   n_projs_computed = 0
