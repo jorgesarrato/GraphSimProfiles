@@ -15,6 +15,115 @@ from torch import Tensor
 
 from torch_geometric.data import Data
 
+
+from torch_geometric.data.datapipes import functional_transform
+from torch_geometric.transforms import BaseTransform
+from torch_geometric.utils import to_undirected
+
+
+
+@functional_transform('knn_graph_grouped')
+class KNNGraph_Grouped(BaseTransform):
+    r"""Creates a k-NN graph based on node positions :obj:`data.pos`
+    and divides nodes into groups based on a user-defined condition.
+    Only nodes within each group can be connected (functional name: :obj:`knn_graph`).
+
+    Args:
+        k (int, optional): The number of neighbors. (default: :obj:`6`)
+        loop (bool, optional): If :obj:`True`, the graph will contain
+            self-loops. (default: :obj:`False`)
+        force_undirected (bool, optional): If set to :obj:`True`, new edges
+            will be undirected. (default: :obj:`False`)
+        flow (str, optional): The flow direction when used in combination with
+            message passing (:obj:`"source_to_target"` or
+            :obj:`"target_to_source"`).
+            If set to :obj:`"source_to_target"`, every target node will have
+            exactly :math:`k` source nodes pointing to it.
+            (default: :obj:`"source_to_target"`)
+        cosine (bool, optional): If :obj:`True`, will use the cosine
+            distance instead of euclidean distance to find nearest neighbors.
+            (default: :obj:`False`)
+        num_workers (int): Number of workers to use for computation. Has no
+            effect in case :obj:`batch` is not :obj:`None`, or the input lies
+            on the GPU. (default: :obj:`1`)
+        group_condition (Callable, optional): A function that takes in the
+            node features or positions and returns a tensor of group indices
+            for each node. Nodes with the same group index can be connected.
+            (default: :obj:`None`)
+    """
+    def __init__(
+        self,
+        k: int = 6,
+        loop: bool = False,
+        force_undirected: bool = False,
+        flow: str = 'source_to_target',
+        cosine: bool = False,
+        num_workers: int = 1,
+        group_condition: Optional[Callable] = None,
+    ) -> None:
+        self.k = k
+        self.loop = loop
+        self.force_undirected = force_undirected
+        self.flow = flow
+        self.cosine = cosine
+        self.num_workers = num_workers
+        self.group_condition = group_condition
+
+    def forward(self, data: Data) -> Data:
+        assert data.pos is not None
+
+        if self.group_condition is not None:
+            # Compute group indices for each node
+            group_indices = self.group_condition(data)
+
+            # Create an empty edge index
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=data.pos.device)
+
+            # Process each group separately
+            unique_groups = group_indices.unique()
+            for group in unique_groups:
+                mask = group_indices == group
+                group_pos = data.pos[mask]
+                group_batch = data.batch[mask] if data.batch is not None else None
+
+                # Compute k-NN graph for the current group
+                group_edge_index = torch_geometric.nn.knn_graph(
+                    group_pos,
+                    self.k,
+                    group_batch,
+                    loop=self.loop,
+                    flow=self.flow,
+                    cosine=self.cosine,
+                    num_workers=self.num_workers,
+                )
+
+                # Map group-specific edge indices back to the original node indices
+                global_edge_index = mask.nonzero(as_tuple=True)[0][group_edge_index]
+                edge_index = torch.cat([edge_index, global_edge_index], dim=1)
+        else:
+            # Compute k-NN graph for all nodes
+            edge_index = torch_geometric.nn.knn_graph(
+                data.pos,
+                self.k,
+                data.batch,
+                loop=self.loop,
+                flow=self.flow,
+                cosine=self.cosine,
+                num_workers=self.num_workers,
+            )
+
+        if self.force_undirected:
+            edge_index = to_undirected(edge_index, num_nodes=data.num_nodes)
+
+        data.edge_index = edge_index
+        data.edge_attr = None
+
+        return data
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(k={self.k}, group_condition={self.group_condition})'
+
+
 class GraphNN(torch.nn.Module):
     """ Graph Regressor model
 
@@ -235,6 +344,7 @@ class GraphCreator():
     GRAPH_TYPES = {
         "KNNGraph": T.KNNGraph,
         "RadiusGraph": T.RadiusGraph,
+        "KNNGraph_grouped": KNNGraph_Grouped,
     }
 
     def __init__(
@@ -368,3 +478,63 @@ class GraphCreator():
         if additional_features is not None:
             return torch.hstack([features, additional_features])
         return features
+    
+
+
+
+"""
+
+        import matplotlib.pyplot as plt
+
+        # Generate toy data
+        num_nodes = 100
+        positions = torch.rand((num_nodes, 2)) * 2 - 1  # Random positions in [-1, 1] x [-1, 1]
+        velocities = torch.rand((num_nodes, 1))  # Random velocities
+        labels = torch.randint(0, 2, (num_nodes,))  # Random labels
+
+        # Create a GraphCreator instance
+        graph_creator = GraphCreator(graph_type="KNNGraph", graph_config={"k": 5})
+
+        # Create graph without condition
+        graph_data_no_condition = graph_creator(positions, velocities)
+
+        # Create graph with group condition based on radius
+        def group_condition(data):
+            radius = torch.linalg.norm(data.pos, dim=1)
+            return (radius > 0.5).long()  # Group 0: radius <= 0.5, Group 1: radius > 0.5
+
+        knn_grouped = KNNGraph_Grouped(k=5, group_condition=group_condition)
+        graph_data_with_condition = knn_grouped(graph_data_no_condition)
+
+        # Convert to NetworkX for visualization
+        G_no_condition = to_networkx(graph_data_no_condition, to_undirected=True)
+        G_with_condition = to_networkx(graph_data_with_condition, to_undirected=True)
+
+        # Plot graphs
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+        # Plot without condition
+        ax = axes[0]
+        nx.draw(
+            G_no_condition,
+            pos=graph_data_no_condition.pos.numpy(),
+            node_size=50,
+            ax=ax,
+            with_labels=False
+        )
+        ax.set_title("Graph without condition")
+
+        # Plot with condition
+        ax = axes[1]
+        nx.draw(
+            G_with_condition,
+            pos=graph_data_with_condition.pos.numpy(),
+            node_size=50,
+            ax=ax,
+            with_labels=False
+        )
+        ax.set_title("Graph with group condition")
+
+        plt.show()
+
+"""
