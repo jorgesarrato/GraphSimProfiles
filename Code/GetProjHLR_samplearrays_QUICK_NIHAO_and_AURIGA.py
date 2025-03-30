@@ -86,7 +86,7 @@ def half_light_r_count_XYZ(X,Y,Z, cylindrical=False):
 main_file_folder = '/scratch/jsarrato/Paper-GraphSimProfiles/work/'
 #main_file_folder = '/home/jorge/Physics/PhD/Paper3/Work/'
 
-gal_data = pd.read_csv(main_file_folder + 'file_labels_NIHAOandAURIGA_PCAfiltered.csv')
+gal_data = pd.read_csv(main_file_folder + 'file_labels_NIHAOandAURIGA_PCAnofiltered.csv')
 
 """gal_data = gal_data[gal_data['name'].str.endswith('h1')]
 gal_data = gal_data.sort_values('m_r3').reset_index(drop = True)"""
@@ -110,7 +110,7 @@ x,y,z = fibonacci_sphere(N_sphere_points)
 
 n_project = N_sphere_points
 
-filename = 'proj_data_NIHAO_and_AURIGA_PCAfilt_samplearr' + str(n_process) + '.csv'
+filename = 'proj_data_NIHAO_and_AURIGA_PCAnofilt_samplearr' + str(n_process) + '.csv'
 
 n_gals = len(paths)
 
@@ -337,11 +337,11 @@ for i in range(startindex, endindex):
         hlrstd_arr[0, project] = hlr
         hlrstd_arr[1, project] = np.std(np.array(VZ))
         
-        torch.save(data_list, main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/posvel_{i}.pkl")
+        torch.save(data_list, main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAnofilt_1000/posvel_{i}.pkl")
 
-        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/hlrstd_arr{i}", hlrstd_arr)
+        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAnofilt_1000/hlrstd_arr{i}", hlrstd_arr)
         
-        np.savez(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/mass_interp{i}.npz", x=p['rbins'], y=p['mass_enc'])
+        np.savez(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAnofilt_1000/mass_interp{i}.npz", x=p['rbins'], y=p['mass_enc'])
 
         stellar_quantities = np.zeros((len(stellar_quantities_to_save), n_stars))
         for j, quantity in enumerate(stellar_quantities_to_save):
@@ -371,8 +371,8 @@ for i in range(startindex, endindex):
                stellar_quantities[j] = np.nan*np.ones(n_stars)
 
 
-        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/stellar_quantities{i}", stellar_quantities)
+        np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAnofilt_1000/stellar_quantities{i}", stellar_quantities)
 
-        #np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAfilt_1000/softenings{i}", np.array([min(h1.s['eps'][indeces2]), min(h1.d['eps'][indeces2])]))
+        #np.save(main_file_folder+f"arrs_NIHAO_and_AURIGA_PCAnofilt_1000/softenings{i}", np.array([min(h1.s['eps'][indeces2]), min(h1.d['eps'][indeces2])]))
           
   n_projs_computed = 0

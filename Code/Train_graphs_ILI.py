@@ -36,12 +36,14 @@ parser.add_argument('hlr_std', type=int, choices=[0, 1], help='Use pre-calculate
 parser.add_argument('N_stars', type=int, help='Number of stars to be used for creating graphs')
 parser.add_argument('GraphNN_type', choices=['Cheb', 'GCN', 'GAT'])
 parser.add_argument('N_proj_per_gal', type = int, help = 'Number of projections per galaxy')
+parser.add_argument('PCAfilter', type = int, choices=[0,1], help = 'Whether to use PCA filtering or not')
 
 
 args = parser.parse_args()
 
 sim = args.sim
 test_long = bool(args.test_long)
+PCA_filter = bool(args.PCAfilter)
 
 capsize_num = 5
 markersize_num = 3
@@ -70,10 +72,13 @@ estimator_masses = []
 seed = 22133
 np.random.seed(seed)
 
+if PCA_filter:
+    data_folder = '/net/debut/scratch/jsarrato/Paper-GraphSimProfiles/work/arrs_NIHAO_and_AURIGA_PCAfilt_1000/'
+    label_file = pd.read_csv('/net/debut/scratch/jsarrato/Paper-GraphSimProfiles/work/proj_data_NIHAO_and_AURIGA_PCAfilt_samplearr.csv')
+else:
+    data_folder = '/net/debut/scratch/jsarrato/Paper-GraphSimProfiles/work/arrs_NIHAO_and_AURIGA_PCAnofilt_1000/'
+    label_file = pd.read_csv('/net/debut/scratch/jsarrato/Paper-GraphSimProfiles/work/proj_data_NIHAO_and_AURIGA_PCAnofilt_samplearr.csv')
 
-data_folder = '/net/debut/scratch/jsarrato/Paper-GraphSimProfiles/work/arrs_NIHAO_and_AURIGA_PCAfilt_1000/'
-
-label_file = pd.read_csv('/net/debut/scratch/jsarrato/Paper-GraphSimProfiles/work/proj_data_NIHAO_and_AURIGA_PCAfilt_samplearr.csv')
 label_file = label_file.drop_duplicates(subset=['name']).reset_index(drop = True)
 label_file['sim'] = label_file['name'].apply(lambda x: 1 if x.startswith('halo') else 0) # 1 for AURIGA, 0 for NIHAO
 
