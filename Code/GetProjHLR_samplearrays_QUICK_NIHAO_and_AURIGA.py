@@ -136,7 +136,7 @@ rheader_list = list(['r'+str(ii+1) for ii in range(np.size(r_array))])
 mrheader_list_circ = list(['m_r_circ'+str(ii+1) for ii in range(np.size(r_array))])
 dispsheader_list_circ = list(['disp_r_circ'+str(ii+1) for ii in range(np.size(r_array))])
 
-headers = ['path','name','i_index','count','angx','angy','angz']
+headers = ['path','name','i_index','count','angx','angy','angz','hlr','hlr_true','eps_s','eps_dm']
 
 print(main_file_folder + filename)
                     
@@ -176,6 +176,8 @@ for i in range(startindex, endindex):
   new_gal_data = pd.DataFrame(columns = headers)
 
   galname = gal_data['name'][i]
+  eps_s = gal_data['eps_s'][i]
+  eps_dm = gal_data['eps_dm'][i]
 
   galpath = paths[i]
 
@@ -307,13 +309,15 @@ for i in range(startindex, endindex):
 
       else:
           r_arr1 = np.ones_like(r_array)*-9999
+          hlr = -9999
+          hlr_true = -9999
 
 
           hfile = open(main_file_folder + '/Logs/'+galname+'_CenterError.dat','w')
           hfile.write(galname+'  '+str(halonum)+'  '+galpath+'  ')
           hfile.close()
 
-      gal_result = [galpath, galname_original ,i, count, x[project], y[project], z[project]]
+      gal_result = [galpath, galname_original ,i, count, x[project], y[project], z[project], hlr, hlr_true, eps_s, eps_dm]
       gal_dict = {headers[i]: [gal_result[i]] for i in range(len(headers))}
       gal_line = pd.DataFrame(gal_dict)
       new_gal_data = pd.concat([new_gal_data, gal_line])
@@ -329,8 +333,6 @@ for i in range(startindex, endindex):
         node_attrs = np.r_[np.array(r_proj).reshape(1,-1), np.array(VZ).reshape(1,-1)].T
 
         data = np.r_[np.array(X).reshape(1,-1), np.array(Y).reshape(1,-1), np.array(VZ).reshape(1,-1)].T
-
-        print(data.shape)
 
         data_list.append(data)
 

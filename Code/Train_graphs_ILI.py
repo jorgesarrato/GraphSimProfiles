@@ -2,7 +2,6 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-
 import numpy as np
 import pandas as pd
 from tqdm.notebook import tqdm
@@ -37,13 +36,14 @@ parser.add_argument('N_stars', type=int, help='Number of stars to be used for cr
 parser.add_argument('GraphNN_type', choices=['Cheb', 'GCN', 'GAT'])
 parser.add_argument('N_proj_per_gal', type = int, help = 'Number of projections per galaxy')
 parser.add_argument('PCAfilter', type = int, choices=[0,1], help = 'Whether to use PCA filtering or not')
-
+parser.add_argument('SAME', type = int, choices=[0,1], help = 'Whether to use the same simulation for training and testing or not')
 
 args = parser.parse_args()
 
 sim = args.sim
 test_long = bool(args.test_long)
 PCA_filter = bool(args.PCAfilter)
+SAME = bool(args.SAME)
 
 capsize_num = 5
 markersize_num = 3
@@ -86,25 +86,50 @@ AU_indices = np.array(label_file[label_file['sim'] == 1]['i_index'], dtype = int
 NH_indices = np.array(label_file[label_file['sim'] == 0]['i_index'], dtype = int)
 print(len(AU_indices), len(NH_indices))
 
-if sim == 'AURIGA':
-	existing_files = [data_folder + f'masses_arr{idx}.npy' for idx in AU_indices]
-	len_train_files = len(existing_files)
-	if test_long:
-		existing_files = existing_files	+ [data_folder + f'masses_arr{idx}.npy' for idx in NH_indices]
-		len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in NH_indices])
-	else:
-		existing_files = existing_files	+ [data_folder + f'masses_arr{idx}.npy' for idx in NH_indices[:100]]
-		len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in NH_indices[:100]])
 
-if sim == 'NIHAO':
-	existing_files = [data_folder + f'masses_arr{idx}.npy' for idx in NH_indices]
-	len_train_files = len(existing_files)
-	if test_long:
-		existing_files = existing_files	+ [data_folder + f'masses_arr{idx}.npy' for idx in AU_indices]
-		len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in AU_indices])
-	else:
-		existing_files = existing_files	+ [data_folder + f'masses_arr{idx}.npy' for idx in AU_indices[:100]]
-		len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in AU_indices[:100]])
+if SAME:
+    # Use the same simulation for training and testing based on 'eps_dm' mask
+    if sim == 'AURIGA':
+        mask = label_file['sim'] == 1  # Select AURIGA simulation
+    elif sim == 'NIHAO':
+        mask = label_file['sim'] == 0  # Select NIHAO simulation
+
+    train_mask = mask & (label_file['eps_dm'] > np.median(label_file[mask]['eps_dm']))  # Apply mask condition for training
+    test_mask = mask & (label_file['eps_dm'] <= np.median(label_file[mask]['eps_dm']))  # Apply mask condition for testing
+
+    train_indices = np.array(label_file[train_mask]['i_index'], dtype=int)
+    test_indices = np.array(label_file[test_mask]['i_index'], dtype=int)
+
+    existing_files = [data_folder + f'masses_arr{idx}.npy' for idx in train_indices]
+    len_train_files = len(existing_files)
+    if test_long:
+        existing_files = existing_files + [data_folder + f'masses_arr{idx}.npy' for idx in test_indices]
+        len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in test_indices])
+    else:
+        existing_files = existing_files + [data_folder + f'masses_arr{idx}.npy' for idx in test_indices[:100]]
+        len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in test_indices[:100]])
+
+else:
+    if sim == 'AURIGA':
+        existing_files = [data_folder + f'masses_arr{idx}.npy' for idx in AU_indices]
+        len_train_files = len(existing_files)
+        if test_long:
+            existing_files = existing_files + [data_folder + f'masses_arr{idx}.npy' for idx in NH_indices]
+            len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in NH_indices])
+        else:
+            existing_files = existing_files + [data_folder + f'masses_arr{idx}.npy' for idx in NH_indices[:100]]
+            len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in NH_indices[:100]])
+
+    elif sim == 'NIHAO':
+        existing_files = [data_folder + f'masses_arr{idx}.npy' for idx in NH_indices]
+        len_train_files = len(existing_files)
+        if test_long:
+            existing_files = existing_files + [data_folder + f'masses_arr{idx}.npy' for idx in AU_indices]
+            len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in AU_indices])
+        else:
+            existing_files = existing_files + [data_folder + f'masses_arr{idx}.npy' for idx in AU_indices[:100]]
+            len_test_files = len([data_folder + f'masses_arr{idx}.npy' for idx in AU_indices[:100]])
+
 
 # Generate random number of stars for each projection
 nstars_arr = np.random.poisson(Nstars, size=(len_train_files + len_test_files) * N_proj_per_gal)
@@ -241,8 +266,8 @@ def collate_fn(batch):
     batch = collater(batch)
     return batch, batch.y
     
-main_file_folder = '/scratch/jsarrato/Wolf_for_FIRE/work/'
-Model_str = f'{args.GraphNN_type}_{sim}_poisson{Nstars}_Nfiles{len_train_files}_Nproj{N_proj_per_gal}_hlrstd{args.hlr_std}'
+main_file_folder = '/net/deimos/scratch/jsarrato/Wolf_for_FIRE/work/'
+Model_str = f'{args.GraphNN_type}_{sim}_testonsame{SAME}_poisson{Nstars}_Nfiles{len_train_files}_Nproj{N_proj_per_gal}_hlrstd{args.hlr_std}'
     
 model_folder = main_file_folder+'Graph+Flow_Mocks_NH/'+Model_str
 if not os.path.exists(model_folder):
