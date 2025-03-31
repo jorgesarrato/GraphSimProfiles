@@ -1,6 +1,8 @@
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+#sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append('Wolf_for_FIRE/code')
+
 
 import numpy as np
 import pandas as pd
@@ -26,6 +28,24 @@ import argparse
 
 from utils import GraphNN, GraphCreator, sample_with_timeout
 
+from scipy.interpolate import interp1d
+
+
+# Set parser arguments directly in the code
+args = argparse.Namespace(
+    mode='train',  # Options: 'train', 'sample', 'sampletest'
+    sim='NIHAO',  # Number of stars
+    test_long=1,  # 0 or 1
+    hlr_std=1,  # 0 or 1
+    N_stars=100,  # Number of stars
+    GraphNN_type='Cheb',  # Options: 'Cheb', 'GCN', 'GAT'
+    N_proj_per_gal=1,  # Number of projections per galaxy
+    PCAfilter=0,  # 0 or 1
+    SAME=1,  # 0 or 1
+    train_on_highres=1  # 0 or 1
+)
+
+
 
 parser = argparse.ArgumentParser(description='Train and evaluate the model.')
 parser.add_argument('mode', choices=['train', 'sample', 'sampletest'], help='Mode to run the script in: train or sample, or sample test set only')
@@ -37,6 +57,8 @@ parser.add_argument('GraphNN_type', choices=['Cheb', 'GCN', 'GAT'])
 parser.add_argument('N_proj_per_gal', type = int, help = 'Number of projections per galaxy')
 parser.add_argument('PCAfilter', type = int, choices=[0,1], help = 'Whether to use PCA filtering or not')
 parser.add_argument('SAME', type = int, choices=[0,1], help = 'Whether to use the same simulation for training and testing or not')
+parser.add_argument('train_on_highres', type = int, choices=[0,1], help = 'If training on same simulation, whether to train on high resolution or low resolution')
+
 
 args = parser.parse_args()
 
@@ -44,6 +66,10 @@ sim = args.sim
 test_long = bool(args.test_long)
 PCA_filter = bool(args.PCAfilter)
 SAME = bool(args.SAME)
+train_on_highres = bool(args.train_on_highres)
+
+if train_on_highres:
+    assert SAME, 'If training on high resolution, SAME must be True'
 
 capsize_num = 5
 markersize_num = 3
@@ -94,8 +120,12 @@ if SAME:
     elif sim == 'NIHAO':
         mask = label_file['sim'] == 0  # Select NIHAO simulation
 
-    train_mask = mask & (label_file['eps_dm'] > np.median(label_file[mask]['eps_dm']))  # Apply mask condition for training
-    test_mask = mask & (label_file['eps_dm'] <= np.median(label_file[mask]['eps_dm']))  # Apply mask condition for testing
+    if train_on_highres:
+        train_mask = mask & (label_file['eps_dm'] <= 1)  # Apply mask condition for training
+        test_mask = mask & (label_file['eps_dm'] > 1)  # Apply mask condition for testing
+    else:
+        train_mask = mask & (label_file['eps_dm'] > 1)  # Apply mask condition for training
+        test_mask = mask & (label_file['eps_dm'] <= 1)  # Apply mask condition for testing
 
     train_indices = np.array(label_file[train_mask]['i_index'], dtype=int)
     test_indices = np.array(label_file[test_mask]['i_index'], dtype=int)
@@ -135,17 +165,26 @@ else:
 nstars_arr = np.random.poisson(Nstars, size=(len_train_files + len_test_files) * N_proj_per_gal)
 #nstars_arr = np.array([Nstars]*((len_train_files + len_test_files) * N_proj_per_gal))
 
+label_mass_radii_frac = np.arange(0.6,2.6,0.2)
+mass_estim_radii_frac = np.array([1, 4/3, 1.67, 1.77, 1.8])
+
+
+hlrs = []
+stds = []
+
 print('Reading Data')
 file_indices = []
 for i, file_name in enumerate(tqdm(existing_files)):
     # Extract the index from the file name
     idx = int(file_name.split('_arr')[-1].split('.npy')[0])
 
-    masses_name = data_folder + f'masses_arr{idx}.npy'
-    hlrstd_name = data_folder + f'hlrstd_ar{idx}.npy'
+    masses_name = data_folder + f'mass_interp{idx}.npz'
+    hlrstd_name = data_folder + f'hlrstd_arr{idx}.npy'
     posvel_name = data_folder + f'posvel_{idx}.pkl'
 
-    masses = np.load(masses_name)
+    mass_interp_data = np.load(masses_name)
+    mass_interpolator = interp1d(mass_interp_data['x'], mass_interp_data['y'])
+
     posvel = torch.load(posvel_name, weights_only=False)
 
     random_projs = np.random.choice(len(posvel), N_proj_per_gal)
@@ -154,9 +193,15 @@ for i, file_name in enumerate(tqdm(existing_files)):
         nstars = nstars_arr[i * N_proj_per_gal + j]  # Use a different random number of stars for each projection
 
         posveldata = posvel[proj_idx]
-        masses_idx = np.log10(masses[:-4, proj_idx])
-            
-        estim_masses = np.array([masses[8, proj_idx], masses[-2, proj_idx], masses[15, proj_idx], masses[16, proj_idx], masses[16, proj_idx]])
+        rxy = np.linalg.norm(posveldata[:nstars, :2], axis=1)
+        hlr = np.median(rxy)
+        vstd = np.std(posveldata[:nstars, -1])
+
+        try:
+            masses_idx = np.log10(mass_interpolator(label_mass_radii_frac*hlr))
+            estim_masses = mass_interpolator(mass_estim_radii_frac*hlr)
+        except:
+            continue
           
         if np.any(np.isnan(posveldata)) or np.any(np.isinf(posveldata)):
             continue
@@ -169,26 +214,64 @@ for i, file_name in enumerate(tqdm(existing_files)):
         stellar_features['velocities'].append(posveldata[:nstars, -1])
         labels.append(masses_idx)
         file_indices.append(i)  # Keep track of the file index
+        stds.append(vstd)
+        hlrs.append(hlr)
             
     if i == len_train_files:
         train_and_val_size = len(labels)
 		
+
+hlrs = np.array(hlrs)
+stds = np.array(stds)
 
 labels2 = np.array(labels)
 
 labels2_train_val = labels2[:train_and_val_size]
 labels2_test = labels2[train_and_val_size:]
 
+hlrs_test = np.array(hlrs[train_and_val_size:])
+hlrs = np.array(hlrs[:train_and_val_size])
+
+stds_test = np.array(stds[train_and_val_size:])
+stds = np.array(stds[:train_and_val_size])
+
 mask_test = np.ones_like(labels2_test[:,0], dtype=bool)
 
 print('Original number of test points:', np.sum(mask_test))
 
+
+main_file_folder = '/net/deimos/scratch/jsarrato/Wolf_for_FIRE/work/'
+Model_str = f'{args.GraphNN_type}_{sim}_testonsame{SAME}_trainonhigh{train_on_highres}_poisson{Nstars}_Nfiles{len_train_files}_Nproj{N_proj_per_gal}_hlrstd{args.hlr_std}'
+    
+model_folder = main_file_folder+'Graph+Flow_Mocks_NH/new/'+Model_str
+if not os.path.exists(model_folder):
+    os.makedirs(model_folder)
+
+# Create normalized histograms for each column in labels2_test and labels2_train_val
 for i in range(labels2_test.shape[1]):
-    mask_test = mask_test & (labels2_test[:,i] > np.min(labels2_train_val[:,i])) & (labels2_test[:,i] < np.max(labels2_train_val[:,i]))
+    mask_test = mask_test & (labels2_test[:, i] > np.min(labels2_train_val[:, i])) & (labels2_test[:, i] < np.max(labels2_train_val[:, i]))
+    
+mask_test = mask_test & (hlrs_test> np.min(hlrs)) & (hlrs_test< np.max(hlrs))
+mask_test = mask_test & (stds_test> np.min(stds)) & (stds_test< np.max(stds))
 
 print('Number of test points:', np.sum(mask_test))
 
 labels2_test_filtered = labels2_test[mask_test]
+
+for i in range(labels2_test.shape[1]):
+    # Plot histograms
+    plt.figure()
+    plt.hist(labels2_train_val[:, i], bins=30, density=True, alpha=0.5, label='Train/Val')
+    plt.hist(labels2_test_filtered[:, i], bins=30, density=True, alpha=0.5, label='Test masked')
+    plt.hist(labels2_test[:, i], bins=30, density=True, alpha=0.5, label='Test unmasked')
+    plt.xlabel(f'Feature {i}')
+    plt.ylabel('Normalized Frequency')
+    plt.legend()
+    plt.title(f'Distribution of Feature {i}')
+    
+    # Save the plot
+    plt.savefig(f"{model_folder}/feature_{i}_distribution.png", bbox_inches='tight')
+    plt.close()
 
 highs = np.max(labels2, axis=0)
 lows = np.min(labels2, axis=0)
@@ -265,14 +348,7 @@ collater = Collater(data_list)
 def collate_fn(batch):
     batch = collater(batch)
     return batch, batch.y
-    
-main_file_folder = '/net/deimos/scratch/jsarrato/Wolf_for_FIRE/work/'
-Model_str = f'{args.GraphNN_type}_{sim}_testonsame{SAME}_poisson{Nstars}_Nfiles{len_train_files}_Nproj{N_proj_per_gal}_hlrstd{args.hlr_std}'
-    
-model_folder = main_file_folder+'Graph+Flow_Mocks_NH/'+Model_str
-if not os.path.exists(model_folder):
-    os.makedirs(model_folder)
-    
+
     
 # Get unique file indices
 unique_file_indices = np.unique(file_indices)
@@ -388,18 +464,18 @@ n_sec = n_min * 60  # Convert minutes to seconds
 
 if args.mode in ['train', 'sample']:
     print('Sampling Training Set')
-    samples_train = sample_with_timeout(posterior_ensemble, train_data_list, N_samples, device, n_sec, 38)
+    samples_train = sample_with_timeout(posterior_ensemble, train_data_list, N_samples, device, n_sec, len(label_mass_radii_frac))
     np.save(model_folder + '/samples_train', samples_train)
 
     print('Sampling Validation Set')
-    samples_val = sample_with_timeout(posterior_ensemble, val_data_list, N_samples, device, n_sec, 38)
+    samples_val = sample_with_timeout(posterior_ensemble, val_data_list, N_samples, device, n_sec, len(label_mass_radii_frac))
     np.save(model_folder + '/samples_val', samples_val)
 else:
     samples_train = np.load(model_folder + '/samples_train.npy')
     samples_val = np.load(model_folder + '/samples_val.npy')
 
 print('Sampling Test Set')
-samples_test = sample_with_timeout(posterior_ensemble, data_list_test, N_samples, device, n_sec, 38)
+samples_test = sample_with_timeout(posterior_ensemble, data_list_test, N_samples, device, n_sec, len(label_mass_radii_frac))
 np.save(model_folder + '/samples_test.npy', samples_test)
 
 xmed = [-0.3765142150803461, -0.32533992583436344, -0.25339925834363414, -0.22224969097651423, -0.1473423980222497, -0.09320148331273177, -0.056860321384425205, 0.04029666254635353, 0.12484548825710756, 0.21384425216316444, 0.26872682323856617, 0.34956736711990116, 0.42076637824474666, 0.4912237330037083, 0.5305315203955501]
@@ -452,7 +528,7 @@ print(r_p84_test - r_p16_test)
 print('')
 
 
-x = np.arange(0.2,4,0.1) # Positions: 1.0 - 9, 1.8 - 17, 1.7 - 16
+x = label_mass_radii_frac
 plt.figure()
 plt.gca().axhline(y = 1, ls = '--', color = 'k')
 
