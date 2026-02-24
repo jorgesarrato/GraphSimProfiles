@@ -325,8 +325,9 @@ def train_posterior(
     """
     posterior.to(device)
     optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "max", factor=0.5, patience=5)
 
-    best_val_loss = float("inf")
+    best_val_lp = float("-inf")
     epochs_no_improve = 0
     train_log_probs, val_log_probs = [], []
 
@@ -355,6 +356,7 @@ def train_posterior(
         mean_val   = float(np.mean(epoch_val_lp))
         train_log_probs.append(mean_train)
         val_log_probs.append(mean_val)
+        scheduler.step(mean_val)
 
         print(
             f"Epoch {epoch + 1:4d} | "
@@ -362,9 +364,10 @@ def train_posterior(
             f"val log-prob:   {mean_val:.4f}"
         )
 
-        if mean_val > best_val_loss:
-            best_val_loss = mean_val
+        if mean_val > best_val_lp:
+            best_val_lp = mean_val
             epochs_no_improve = 0
+
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= stop_after_epochs:
