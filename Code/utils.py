@@ -12,7 +12,8 @@ import torch
 import torch_geometric
 import torch_geometric.transforms as T
 from torch import Tensor
-from torch_geometric.data import Data
+from torch.autograd import Function
+from torch_geometric.data import Batch, Data
 from torch_geometric.data.datapipes import functional_transform
 from torch_geometric.nn import ChebConv, GATConv, GCNConv
 from torch_geometric.transforms import BaseTransform
@@ -118,6 +119,9 @@ class GraphNN(torch.nn.Module):
     Architecture: ``num_graph_layers`` message-passing layers → global mean
     pooling → optional (hlr, std) concatenation → ``num_fc_layers`` linear
     layers.
+    
+    This module acts as the shared feature extractor in both the standard
+    training and the DANN setup.
 
     Parameters
     ----------
@@ -295,15 +299,191 @@ class FlowPosterior(torch.nn.Module):
     @torch.no_grad()
     def sample(self, num_samples: int, data: Data) -> Tensor:
         """Draw ``num_samples`` samples from p(labels | data).
-
-        Returns tensor of shape ``(num_samples, n_labels)``.
+    
+        ``data`` must contain exactly one graph. Returns shape ``(num_samples, n_labels)``.
         """
         context = self.embedding_net(data)
-        # nflows expects context shape (batch, context_dim); repeat for n samples
-        context_expanded = context.repeat_interleave(num_samples, dim=0)
-        samples = self.flow.sample(num_samples, context=context)
-        return samples
+        return self.flow.sample(num_samples, context=context)
 
+class GradientReversalFunction(Function):
+    """Identity in the forward pass; negates and scales gradients in backward.
+
+    Implements the gradient reversal layer of Ganin et al. (2016) without
+    any learnable parameters.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, lambda_: float) -> Tensor:  # type: ignore[override]
+        ctx.save_for_backward(torch.tensor(lambda_))
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):  # type: ignore[override]
+        (lambda_,) = ctx.saved_tensors
+        return -lambda_ * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Thin ``nn.Module`` wrapper around `GradientReversalFunction`.
+
+    Parameters
+    ----------
+    lambda_ : float
+        Reversal strength.  Increase from 0 → 1 over training following the
+        Ganin schedule (see :func:`ganin_lambda_schedule`).
+    """
+
+    def __init__(self, lambda_: float = 1.0) -> None:
+        super().__init__()
+        self.lambda_ = lambda_
+
+    def forward(self, x: Tensor) -> Tensor:
+        return GradientReversalFunction.apply(x, self.lambda_)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(lambda_={self.lambda_:.4f})"
+
+
+class DomainClassifier(nn.Module):
+    """Binary MLP that predicts domain membership (source=0, target=1).
+
+    The gradient reversal layer ensures the shared encoder learns features
+    that are indistinguishable across domains while the classifier tries
+    to discriminate them.
+
+    Parameters
+    ----------
+    in_features : int
+        Dimensionality of the context vector produced by :class:`GraphNN`.
+    hidden_features : int
+        Width of the hidden layers.
+    lambda_ : float
+        Initial reversal strength.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int = 64,
+        lambda_: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.grl = GradientReversalLayer(lambda_=lambda_)
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features, hidden_features),
+            nn.ReLU(),
+            nn.Linear(hidden_features, hidden_features),
+            nn.ReLU(),
+            nn.Linear(hidden_features, 1),  # logit for P(target domain)
+        )
+
+    def forward(self, context: Tensor) -> Tensor:
+        """Return domain logits; shape ``(batch_size, 1)``."""
+        return self.classifier(self.grl(context))
+
+    def set_lambda(self, lambda_: float) -> None:
+        """Update reversal strength (call once per epoch during training)."""
+        self.grl.lambda_ = lambda_
+
+
+class DANNFlowPosterior(nn.Module):
+    """Full DANN model: shared GNN encoder + flow task head + domain classifier.
+
+    Parameters
+    ----------
+    embedding_net : GraphNN
+        Shared feature extractor.
+    flow : Flow
+        Conditional normalizing flow (task head).
+    domain_classifier : DomainClassifier
+        Adversarial domain head (contains the GRL).
+    """
+
+    def __init__(
+        self,
+        embedding_net: GraphNN,
+        flow: Flow,
+        domain_classifier: DomainClassifier,
+    ) -> None:
+        super().__init__()
+        self.embedding_net     = embedding_net
+        self.flow              = flow
+        self.domain_classifier = domain_classifier
+
+    def log_prob(self, labels: Tensor, data: Data) -> Tensor:
+        """Per-sample log p(labels | data). Used during validation."""
+        return self.flow.log_prob(labels, context=self.embedding_net(data))
+
+    @torch.no_grad()
+    def sample(self, num_samples: int, data: Data) -> Tensor:
+        """Shape: ``(num_samples, n_labels)``."""
+        return self.flow.sample(num_samples, context=self.embedding_net(data))
+
+    def dann_forward(
+        self,
+        src_batch: Data,
+        src_labels: Tensor,
+        tgt_batch: Data,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Single DANN forward pass.
+
+        Parameters
+        ----------
+        src_batch : Data
+            Batched graphs from the **source** (labelled) domain.
+        src_labels : Tensor
+            Mass labels for ``src_batch``; shape ``(n_src, n_labels)``.
+        tgt_batch : Data
+            Batched graphs from the **target** (unlabelled) domain.
+
+        Returns
+        -------
+        task_loss : Tensor
+            ``-mean log p(y | x)`` on source samples.
+        domain_loss : Tensor
+            Binary cross-entropy of the domain classifier on all samples.
+        domain_acc : Tensor
+            Fraction of correctly classified domain labels (diagnostic).
+        """
+        n_src = src_batch.num_graphs
+        n_tgt = tgt_batch.num_graphs
+
+        src_context = self.embedding_net(src_batch)
+        tgt_context = self.embedding_net(tgt_batch)
+
+        task_loss = -self.flow.log_prob(src_labels, context=src_context).mean()
+
+        domain_labels = torch.cat([
+            torch.zeros(n_src, 1, device=src_context.device),
+            torch.ones( n_tgt, 1, device=tgt_context.device),
+        ])
+        all_context   = torch.cat([src_context, tgt_context], dim=0)
+        domain_logits = self.domain_classifier(all_context)   # GRL reverses grad
+        domain_loss   = nn.functional.binary_cross_entropy_with_logits(
+            domain_logits, domain_labels
+        )
+
+        with torch.no_grad():
+            preds      = (domain_logits.sigmoid() > 0.5).float()
+            domain_acc = (preds == domain_labels).float().mean()
+
+        return task_loss, domain_loss, domain_acc
+
+def ganin_lambda_schedule(epoch: int, max_epochs: int, gamma: float = 10.0) -> float:
+    """Smooth 0→1 schedule for the gradient reversal strength. (Ganin et al. 2016)
+
+    Parameters
+    ----------
+    epoch : int
+        Current epoch (0-indexed).
+    max_epochs : int
+        Total number of training epochs.
+    gamma : float
+        Controls the steepness of the sigmoid ramp.
+    """
+    p = epoch / max_epochs
+    return 2.0 / (1.0 + np.exp(-gamma * p)) - 1.0
+    
 class GraphCreator:
     """Convert raw phase-space arrays into ``torch_geometric.data.Data`` graphs.
 
@@ -406,7 +586,7 @@ class TimeoutException(Exception):
 
 
 def sample_with_timeout(
-    posterior: FlowPosterior,
+    posterior: Union[FlowPosterior, DANNFlowPosterior],
     data_list: list,
     n_samples: int,
     device: torch.device,
