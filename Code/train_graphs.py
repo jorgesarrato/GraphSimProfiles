@@ -216,41 +216,6 @@ def population_indices(label_file: pd.DataFrame, key: str) -> np.ndarray:
         )
 
     return np.array(label_file[masks[key]]["i_index"], dtype=int)
-    
-def resolve_file_indices(
-    label_file: pd.DataFrame,
-    sim: str,
-    same: bool,
-    train_on_highres: bool,
-    test_long: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (train_indices, test_indices) into label_file."""
-    au_idx = np.array(label_file[label_file["sim"] == 1]["i_index"], dtype=int)
-    nh_idx = np.array(label_file[label_file["sim"] == 0]["i_index"], dtype=int)
-
-    if same:
-        res_limits = {"AURIGA": 0.25, "NIHAO": 1.0}
-        sim_flag = 1 if sim == "AURIGA" else 0
-        res_lim = res_limits[sim]
-        mask = label_file["sim"] == sim_flag
-        if train_on_highres:
-            train_mask = mask & (label_file["eps_dm"] <= res_lim)
-            test_mask  = mask & (label_file["eps_dm"] >  res_lim)
-        else:
-            train_mask = mask & (label_file["eps_dm"] >  res_lim)
-            test_mask  = mask & (label_file["eps_dm"] <= res_lim)
-        train_idx = np.array(label_file[train_mask]["i_index"], dtype=int)
-        test_idx  = np.array(label_file[test_mask]["i_index"],  dtype=int)
-    else:
-        if sim == "AURIGA":
-            train_idx, test_idx = au_idx, nh_idx
-        else:
-            train_idx, test_idx = nh_idx, au_idx
-
-    if not test_long:
-        test_idx = test_idx[:100]
-
-    return train_idx, test_idx
 
 def resolve_file_indices(
     label_file: pd.DataFrame,
