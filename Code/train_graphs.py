@@ -31,32 +31,59 @@ from utils import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate GNN + normalizing flow posterior."
+        description="Train and evaluate GNN + normalizing flow posterior.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Population keys
+---------------
+  NIHAO_lo   low-resolution  NIHAO  (eps_dm >  1.0 kpc)
+  NIHAO_hi   high-resolution NIHAO  (eps_dm <= 1.0 kpc)
+  NIHAO_all  all NIHAO galaxies
+  AURIGA_lo  low-resolution  AURIGA (eps_dm >  0.25 kpc)
+  AURIGA_hi  high-resolution AURIGA (eps_dm <= 0.25 kpc)
+  AURIGA_all all AURIGA galaxies
+  ALL        every galaxy from both simulations
+
+Examples
+-------------------
+  # Train on NIHAO low-res Test on NIHAO high-res
+  train_graphs.py train NIHAO_lo NIHAO_hi 1 100 Cheb 8 0
+
+  # Train on all NIHAO, test on all AURIGA
+  train_graphs.py train NIHAO_all AURIGA_all 1 100 Cheb 8 0
+
+  # Train on everything, test on high-res AURIGA
+  train_graphs.py train ALL AURIGA_hi 1 100 Cheb 8 0
+""",
     )
     parser.add_argument(
         "mode",
         choices=["train", "sample", "sampletest"],
         help="Run mode: train, sample (train+val+test), or sampletest (test only)",
     )
-    parser.add_argument("sim", choices=["AURIGA", "NIHAO"], help="Simulation type")
     parser.add_argument(
-        "test_long", type=int, choices=[0, 1], help="Use full test set (1) or first 100 (0)"
+        "train_set",
+        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all",
+                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "ALL"],
+        help="Population to train on (see Population keys below)",
     )
     parser.add_argument(
-        "hlr_std", type=int, choices=[0, 1], help="Append hlr/std scalars to embedding (0|1)"
+        "test_set",
+        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all",
+                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "ALL"],
+        help="Population to test on (see Population keys below)",
+    )
+    parser.add_argument(
+        "test_long", type=int, choices=[0, 1],
+        help="Use full test set (1) or first 100 galaxies (0)",
     )
     parser.add_argument("N_stars", type=int, help="Expected number of stars (Poisson mean)")
     parser.add_argument("GraphNN_type", choices=["Cheb", "GCN", "GAT"])
     parser.add_argument("N_proj_per_gal", type=int, help="Projections per galaxy")
     parser.add_argument("PCAfilter", type=int, choices=[0, 1], help="PCA-filtered data (0|1)")
     parser.add_argument(
-        "SAME", type=int, choices=[0, 1], help="Train and test on same simulation (0|1)"
-    )
-    parser.add_argument(
-        "train_on_highres",
-        type=int,
-        choices=[0, 1],
-        help="Train on high-res, test on low-res within same sim (0|1)",
+        "--hlr_std", type=int, choices=[0, 1], default=1,
+        help="Append hlr/std scalars to embedding (default: 1)",
     )
     return parser.parse_args()
 
@@ -120,7 +147,39 @@ def load_label_file(data_folder: str, pca_filter: bool) -> pd.DataFrame:
     df["sim"] = df["name"].apply(lambda x: 1 if x.startswith("halo") else 0)
     return df
 
+def population_indices(label_file: pd.DataFrame, key: str) -> np.ndarray:
+    """Return the i_index array for a named galaxy population.
 
+    Population keys
+    ---------------
+    NIHAO_lo   low-resolution  NIHAO  (eps_dm >  1.0 kpc)
+    NIHAO_hi   high-resolution NIHAO  (eps_dm <= 1.0 kpc)
+    NIHAO_all  all NIHAO galaxies
+    AURIGA_lo  low-resolution  AURIGA (eps_dm >  0.25 kpc)
+    AURIGA_hi  high-resolution AURIGA (eps_dm <= 0.25 kpc)
+    AURIGA_all all AURIGA galaxies
+    ALL        every galaxy from both simulations
+    """
+    is_nihao  = label_file["sim"] == 0
+    is_auriga = label_file["sim"] == 1
+
+    masks = {
+        "NIHAO_lo":   is_nihao  & (label_file["eps_dm"] >  1.0),
+        "NIHAO_hi":   is_nihao  & (label_file["eps_dm"] <= 1.0),
+        "NIHAO_all":  is_nihao,
+        "AURIGA_lo":  is_auriga & (label_file["eps_dm"] >  0.25),
+        "AURIGA_hi":  is_auriga & (label_file["eps_dm"] <= 0.25),
+        "AURIGA_all": is_auriga,
+        "ALL":        pd.Series(True, index=label_file.index),
+    }
+
+    if key not in masks:
+        raise ValueError(
+            f"Unknown population key '{key}'. Valid keys: {list(masks.keys())}"
+        )
+
+    return np.array(label_file[masks[key]]["i_index"], dtype=int)
+    
 def resolve_file_indices(
     label_file: pd.DataFrame,
     sim: str,
@@ -156,7 +215,21 @@ def resolve_file_indices(
 
     return train_idx, test_idx
 
+def resolve_file_indices(
+    label_file: pd.DataFrame,
+    train_set: str,
+    test_set: str,
+    test_long: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (train_indices, test_indices) for the requested populations."""
+    train_idx = population_indices(label_file, train_set)
+    test_idx  = population_indices(label_file, test_set)
 
+    if not test_long:
+        test_idx = test_idx[:100]
+
+    return train_idx, test_idx
+    
 def load_phase_space(
     data_folder: str,
     file_indices_train: np.ndarray,
@@ -468,13 +541,9 @@ def plot_label_distributions(
 def main() -> None:
     args = parse_args()
 
-    test_long        = bool(args.test_long)
-    pca_filter       = bool(args.PCAfilter)
-    same             = bool(args.SAME)
-    train_on_highres = bool(args.train_on_highres)
-    use_hlr_std      = bool(args.hlr_std)
-    if train_on_highres:
-        assert same, "train_on_highres=1 requires SAME=1"
+    test_long   = bool(args.test_long)
+    pca_filter  = bool(args.PCAfilter)
+    use_hlr_std = bool(args.hlr_std)
 
     accelerator = Accelerator()
     device = accelerator.device
@@ -490,15 +559,15 @@ def main() -> None:
     main_work_dir = "/net/deimos/scratch/jsarrato/Wolf_for_FIRE/work/"
 
     model_str = (
-        f"{args.GraphNN_type}_{args.sim}"
-        f"_testonsame{same}_trainonhigh{train_on_highres}"
+        f"{args.GraphNN_type}"
+        f"_train{args.train_set}_test{args.test_set}"
         f"_poisson{args.N_stars}_Nfiles{{len_train}}"
         f"_Nproj{args.N_proj_per_gal}_hlrstd{args.hlr_std}"
     )
 
     label_file = load_label_file(data_folder, pca_filter)
     train_indices, test_indices = resolve_file_indices(
-        label_file, args.sim, same, train_on_highres, test_long
+        label_file, args.train_set, args.test_set, test_long
     )
     print(f"Train galaxies: {len(train_indices)} | Test galaxies: {len(test_indices)}")
 
@@ -667,7 +736,7 @@ def main() -> None:
         label_mass_radii_frac,
         ratio_stats,
         classical_rel,
-        sim=args.sim,
+        sim=f"{args.train_set} -> {args.test_set}",
         nstars=args.N_stars,
         save_path=os.path.join(model_folder, "TrainingVsValidationVsTest.png"),
     )
@@ -675,7 +744,8 @@ def main() -> None:
     plot_data = dict(
         label_mass_radii_frac=label_mass_radii_frac,
         ratio_stats={k: {"med": v[0], "p16": v[1], "p84": v[2]} for k, v in ratio_stats.items()},
-        sim=args.sim,
+        train_set=args.train_set,
+        test_set=args.test_set,
         Nstars=args.N_stars,
         actual_n=nstars_arr,
         seed=seed,
