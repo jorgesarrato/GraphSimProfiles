@@ -36,13 +36,19 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Population keys
 ---------------
-  NIHAO_lo   low-resolution  NIHAO  (eps_dm >  1.0 kpc)
-  NIHAO_hi   high-resolution NIHAO  (eps_dm <= 1.0 kpc)
-  NIHAO_all  all NIHAO galaxies
-  AURIGA_lo  low-resolution  AURIGA (eps_dm >  0.25 kpc)
-  AURIGA_hi  high-resolution AURIGA (eps_dm <= 0.25 kpc)
-  AURIGA_all all AURIGA galaxies
-  ALL        every galaxy from both simulations
+  NIHAO_lo      low-resolution  NIHAO  (eps_dm >  1.0 kpc)
+  NIHAO_hi      high-resolution NIHAO  (eps_dm <= 1.0 kpc)
+  NIHAO_all     all NIHAO galaxies
+  NIHAO_shared  NIHAO galaxies in the eps_dm range shared with AURIGA
+  AURIGA_lo     low-resolution  AURIGA (eps_dm >  0.25 kpc)
+  AURIGA_hi     high-resolution AURIGA (eps_dm <= 0.25 kpc)
+  AURIGA_all    all AURIGA galaxies
+  AURIGA_shared AURIGA galaxies in the eps_dm range shared with NIHAO
+  ALL           every galaxy from both simulations
+  ALL_shared    every galaxy from both simulations, shared range only
+
+  The shared range is computed from the data as:
+    [max(NIHAO_min, AURIGA_min), min(NIHAO_max, AURIGA_max)]
 
 Examples
 -------------------
@@ -54,6 +60,12 @@ Examples
 
   # Train on everything, test on high-res AURIGA
   train_graphs.py train ALL AURIGA_hi 1 100 Cheb 8 0
+  
+  # Train on NIHAO at shared resolutions, test on AURIGA at shared resolutions
+  train_graphs.py train NIHAO_shared AURIGA_shared 1 100 Cheb 8 0
+
+  # Train on everything at shared resolutions, test on AURIGA shared
+  train_graphs.py train ALL_shared AURIGA_shared 1 100 Cheb 8 0
 """,
     )
     parser.add_argument(
@@ -63,14 +75,16 @@ Examples
     )
     parser.add_argument(
         "train_set",
-        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all",
-                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "ALL"],
+        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all", "NIHAO_shared",
+                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "AURIGA_shared",
+                 "ALL", "ALL_shared"],
         help="Population to train on (see Population keys below)",
     )
     parser.add_argument(
         "test_set",
-        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all",
-                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "ALL"],
+        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all", "NIHAO_shared",
+                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "AURIGA_shared",
+                 "ALL", "ALL_shared"],
         help="Population to test on (see Population keys below)",
     )
     parser.add_argument(
@@ -146,6 +160,29 @@ def load_label_file(data_folder: str, pca_filter: bool) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["name"]).reset_index(drop=True)
     df["sim"] = df["name"].apply(lambda x: 1 if x.startswith("halo") else 0)
     return df
+
+def shared_eps_dm_range(label_file: pd.DataFrame) -> tuple[float, float]:
+    """Return the overlapping eps_dm range between NIHAO and AURIGA.
+
+    Computes [max(nh_min, au_min), min(nh_max, au_max)] from the actual
+    data, so no hard-coded resolution thresholds are needed.
+
+    Raises ValueError if the two simulations share no eps_dm range.
+    """
+    nh_eps = label_file.loc[label_file["sim"] == 0, "eps_dm"]
+    au_eps = label_file.loc[label_file["sim"] == 1, "eps_dm"]
+
+    lo = max(nh_eps.min(), au_eps.min())
+    hi = min(nh_eps.max(), au_eps.max())
+
+    if lo >= hi:
+        raise ValueError(
+            f"No overlapping eps_dm range between NIHAO "
+            f"[{nh_eps.min():.3f}, {nh_eps.max():.3f}] and AURIGA "
+            f"[{au_eps.min():.3f}, {au_eps.max():.3f}]."
+        )
+
+    return lo, hi
 
 def population_indices(label_file: pd.DataFrame, key: str) -> np.ndarray:
     """Return the i_index array for a named galaxy population.
