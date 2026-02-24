@@ -9,6 +9,7 @@ from typing import Callable, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch_geometric
 import torch_geometric.transforms as T
 from torch import Tensor
@@ -113,7 +114,7 @@ class KNNGraphGrouped(BaseTransform):
             f"(k={self.k}, group_condition={self.group_condition})"
         )
 
-class GraphNN(torch.nn.Module):
+class GraphNN(nn.Module):
     """GNN encoder that maps a graph batch to a fixed-size context vector.
 
     Architecture: ``num_graph_layers`` message-passing layers → global mean
@@ -166,7 +167,7 @@ class GraphNN(torch.nn.Module):
         hlr_std: bool = True,
         graph_layer_name: str = "ChebConv",
         graph_layer_params: Optional[dict] = None,
-        activation: Union[str, torch.nn.Module, Callable] = "relu",
+        activation: Union[str, nn.Module, Callable] = "relu",
         activation_params: Optional[dict] = None,
     ) -> None:
         super().__init__()
@@ -175,7 +176,7 @@ class GraphNN(torch.nn.Module):
         graph_layer_params = graph_layer_params or {}
         activation_params = activation_params or {}
 
-        self.graph_layers = torch.nn.ModuleList()
+        self.graph_layers = nn.ModuleList()
         for i in range(num_graph_layers):
             n_in = in_channels if i == 0 else hidden_graph_channels
             self.graph_layers.append(
@@ -184,16 +185,16 @@ class GraphNN(torch.nn.Module):
                 )
             )
 
-        self.fc_layers = torch.nn.ModuleList()
+        self.fc_layers = nn.ModuleList()
         for i in range(num_fc_layers):
             # After pooling, optionally concatenate hlr and std (2 extra dims)
             n_in = (hidden_graph_channels + 2) if (i == 0 and hlr_std) else hidden_fc_channels
             n_out = out_channels if i == num_fc_layers - 1 else hidden_fc_channels
-            self.fc_layers.append(torch.nn.Linear(n_in, n_out))
+            self.fc_layers.append(nn.Linear(n_in, n_out))
 
         if isinstance(activation, str):
-            self.activation = getattr(torch.nn.functional, activation)
-        elif isinstance(activation, (torch.nn.Module, Callable)):
+            self.activation = getattr(nn.functional, activation)
+        elif isinstance(activation, (nn.Module, Callable)):
             self.activation = activation
         else:
             raise ValueError(f"Unsupported activation type: {type(activation)}")
@@ -225,7 +226,7 @@ class GraphNN(torch.nn.Module):
         out_dim: int,
         layer_name: str,
         layer_params: dict,
-    ) -> torch.nn.Module:
+    ) -> nn.Module:
         if layer_name not in self.GRAPH_LAYERS:
             raise ValueError(
                 f"Unknown graph layer '{layer_name}'. "
@@ -275,7 +276,7 @@ def build_maf_flow(
     )
 
 
-class FlowPosterior(torch.nn.Module):
+class FlowPosterior(nn.Module):
     """Wraps a GNN embedding network and a conditional normalizing flow.
 
     Parameters
