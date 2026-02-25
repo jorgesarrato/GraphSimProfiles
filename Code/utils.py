@@ -287,14 +287,32 @@ class FlowPosterior(nn.Module):
         Conditional normalizing flow.
     """
 
-    def __init__(self, embedding_net: GraphNN, flow: Flow) -> None:
+    def __init__(
+        self, 
+        embedding_net: GraphNN, 
+        flow: Flow, 
+        mask_missing: Optional[str] = None
+    ) -> None:
         super().__init__()
         self.embedding_net = embedding_net
         self.flow = flow
+        self.mask_missing = mask_missing
 
     def log_prob(self, labels: Tensor, data: Data) -> Tensor:
         """Return log p(labels | data) for a batch."""
         context = self.embedding_net(data)
+        
+        if self.mask_missing == "mask":
+            labels = labels * data.mask
+            context = torch.cat([context, data.mask], dim=1)
+            
+        elif self.mask_missing == "BIF":
+            # Bayesian Imputation: Use the flow to guess the missing values
+            with torch.no_grad():
+                imputed = self.flow.sample(1, context=context).squeeze(1)
+            # Combine known labels with imputed labels
+            labels = (labels * data.mask) + (imputed * (1.0 - data.mask))
+            
         return self.flow.log_prob(labels, context=context)
 
     @torch.no_grad()
@@ -304,6 +322,8 @@ class FlowPosterior(nn.Module):
         ``data`` must contain exactly one graph. Returns shape ``(num_samples, n_labels)``.
         """
         context = self.embedding_net(data)
+        if self.mask_missing == "mask":
+            context = torch.cat([context, data.mask], dim=1)
         return self.flow.sample(num_samples, context=context)
 
 class GradientReversalFunction(Function):
@@ -405,20 +425,33 @@ class DANNFlowPosterior(nn.Module):
         embedding_net: GraphNN,
         flow: Flow,
         domain_classifier: DomainClassifier,
+        mask_missing: Optional[str] = None
     ) -> None:
         super().__init__()
         self.embedding_net     = embedding_net
         self.flow              = flow
         self.domain_classifier = domain_classifier
+        self.mask_missing      = mask_missing
 
     def log_prob(self, labels: Tensor, data: Data) -> Tensor:
         """Per-sample log p(labels | data). Used during validation."""
-        return self.flow.log_prob(labels, context=self.embedding_net(data))
+        if self.mask_missing == "mask":
+            labels = labels * data.mask
+            context = torch.cat([context, data.mask], dim=1)
+        elif self.mask_missing == "BIF":
+            with torch.no_grad():
+                imputed = self.flow.sample(1, context=context).squeeze(1)
+            labels = (labels * data.mask) + (imputed * (1.0 - data.mask))
+            
+        return self.flow.log_prob(labels, context=context)
 
     @torch.no_grad()
     def sample(self, num_samples: int, data: Data) -> Tensor:
         """Shape: ``(num_samples, n_labels)``."""
-        return self.flow.sample(num_samples, context=self.embedding_net(data))
+        context = self.embedding_net(data)
+        if self.mask_missing == "mask":
+            context = torch.cat([context, data.mask], dim=1)
+        return self.flow.sample(num_samples, context=context)
 
     def dann_forward(
         self,
@@ -452,7 +485,19 @@ class DANNFlowPosterior(nn.Module):
         src_context = self.embedding_net(src_batch)
         tgt_context = self.embedding_net(tgt_batch)
 
-        task_loss = -self.flow.log_prob(src_labels, context=src_context).mean()
+        if self.mask_missing == "mask":
+            src_labels_flow = src_labels * src_batch.mask
+            src_context_flow = torch.cat([src_context, src_batch.mask], dim=1)
+            task_loss = -self.flow.log_prob(src_labels_flow, context=src_context_flow).mean()
+            
+        elif self.mask_missing == "BIF":
+            with torch.no_grad():
+                imputed = self.flow.sample(1, context=src_context).squeeze(1)
+            src_labels_flow = (src_labels * src_batch.mask) + (imputed * (1.0 - src_batch.mask))
+            task_loss = -self.flow.log_prob(src_labels_flow, context=src_context).mean()
+            
+        else:
+            task_loss = -self.flow.log_prob(src_labels, context=src_context).mean()
 
         domain_labels = torch.cat([
             torch.zeros(n_src, 1, device=src_context.device),

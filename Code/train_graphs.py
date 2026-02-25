@@ -182,6 +182,11 @@ DANN examples
         "--dann_domain_hidden", type=int, default=64,
         help="Hidden width of the domain-classifier MLP (default: 64)",
     )
+    
+    parser.add_argument(
+        "--mask_missing", choices=["mask", "BIF"], default=None,
+        help="Strategy for masking unresolved radii: 'mask' (context aware) or 'BIF' (Bayesian Imputation)",
+    )
     return parser.parse_args()
 
 
@@ -294,6 +299,7 @@ def load_phase_space(
     nstars_arr: np.ndarray,
     label_mass_radii_frac: np.ndarray,
     mass_estim_radii_frac: np.ndarray,
+    label_file: pd.DataFrame,
 ) -> dict:
     """Read all galaxy files for source and target sets.
 
@@ -301,6 +307,7 @@ def load_phase_space(
         positions, velocities, labels, file_indices,
         hlrs, stds, estimator_masses, train_and_val_size
     """
+    masks = []
     all_indices = np.concatenate([file_indices_src, file_indices_tgt])
     len_src     = len(file_indices_src)
 
@@ -317,7 +324,9 @@ def load_phase_space(
         mass_interpolator = interp1d(mass_data["x"], mass_data["y"])
         posvel            = torch.load(posvel_name, weights_only=False)
 
-        proj_indices = np.random.choice(len(posvel), n_proj_per_gal)
+        proj_indices      = np.random.choice(len(posvel), n_proj_per_gal)
+
+        eps_dm            = label_file.loc[label_file["i_index"] == idx, "eps_dm"].values[0]
 
         for j, proj_idx in enumerate(proj_indices):
             nstars = nstars_arr[i * n_proj_per_gal + j]
@@ -336,6 +345,8 @@ def load_phase_space(
             if np.any(~np.isfinite(data)) or np.any(~np.isfinite(masses_idx)):
                 continue
 
+            mask = (label_mass_radii_frac * hlr) >= (3.0 * eps_dm)
+
             positions.append(data[:nstars, :2])
             velocities.append(data[:nstars, -1])
             labels.append(masses_idx)
@@ -343,6 +354,7 @@ def load_phase_space(
             hlrs.append(hlr)
             stds.append(vstd)
             estimator_masses.append(estim)
+            masks.append(mask)
 
         if i == len_src - 1:
             train_and_val_size = len(labels)
@@ -356,6 +368,7 @@ def load_phase_space(
         stds               = np.array(stds),
         estimator_masses   = np.array(estimator_masses),
         train_and_val_size = train_and_val_size,
+        masks              = np.array(masks),
     )
 
 def build_graph_list(
@@ -371,6 +384,7 @@ def build_graph_list(
             velocities = data["velocities"][i],
             labels     = data["labels"][i],
         )
+        graph.mask = torch.tensor(data["masks"][i], dtype=torch.float32).reshape(1, -1)
         graph.hlr = torch.tensor(
             torch.quantile(10 ** graph.x[:, 0], 0.5), dtype=torch.float32
         ).reshape(1, 1)
@@ -784,10 +798,11 @@ def main() -> None:
     n_total    = (len(src_indices) + len(tgt_indices)) * args.N_proj_per_gal
     nstars_arr = np.random.poisson(args.N_stars, size=n_total)
 
-    raw      = load_phase_space(
+    raw        = load_phase_space(
         data_folder, src_indices, tgt_indices,
         args.N_proj_per_gal, nstars_arr,
         label_mass_radii_frac, mass_estim_radii_frac,
+        label_file
     )
     src_size = raw["train_and_val_size"]   # projection-level boundary
 
@@ -864,9 +879,14 @@ def main() -> None:
         hlr_std               = use_hlr_std,
         **layer_cfg,
     )
+
+    context_dim = 128
+    if args.mask_missing == "mask":
+        context_dim += n_labels
+
     flow = build_maf_flow(
         features         = n_labels,
-        context_features = 128,
+        context_features = context_dim,
         hidden_features  = 128,
         num_transforms   = 4,
     )
@@ -881,9 +901,10 @@ def main() -> None:
             embedding_net     = embedding,
             flow              = flow,
             domain_classifier = domain_cls,
+            mask_missing      = args.mask_missing,
         )
     else:
-        posterior = FlowPosterior(embedding_net=embedding, flow=flow)
+        posterior = FlowPosterior(embedding_net=embedding, flow=flow, mask_missing= args.mask_missing)
 
     posterior_path = os.path.join(model_folder, "posterior.pkl")
 
