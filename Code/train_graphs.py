@@ -276,10 +276,31 @@ def resolve_indices(
         idx = idx[:limit]
     return idx
     
-def get_split_indices(label_file, key, test_size=0.1, limit=None):
+def get_split_indices(label_file, key, test_size=0.1, limit=None, seed=None):
+    """Split key into source (train/val) and target (test) indices.
+
+    Parameters
+    ----------
+    label_file : pd.DataFrame
+    key : str
+        Population key (same set accepted by ``resolve_indices``).
+    test_size : float
+        Fraction of galaxies to hold out as the target/test set.
+    limit : int | None
+        If given, cap the *target* indices at this number.
+        The source indices are never capped here.
+    seed : int | None
+        Seed for the local RNG used to shuffle. Does not affect the global
+        NumPy or PyTorch RNG state.
+
+    Returns
+    -------
+    src_indices, tgt_indices : np.ndarray
+    """
     full_idx = resolve_indices(label_file, key)
     
-    np.random.shuffle(full_idx)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(full_idx)
     
     split_point = int(len(full_idx) * (1 - test_size))
     
@@ -784,7 +805,7 @@ def main() -> None:
     tgt_key = args.test_set
 
     if src_key == tgt_key:
-        src_indices, tgt_indices = get_split_indices(label_file, src_key, limit=test_limit)
+        src_indices, tgt_indices = get_split_indices(label_file, src_key, limit=test_limit, seed=seed)
     else:
         src_indices = resolve_indices(label_file, src_key)
         tgt_indices = resolve_indices(label_file, tgt_key, limit=test_limit)
@@ -807,9 +828,10 @@ def main() -> None:
     src_size = raw["train_and_val_size"]   # projection-level boundary
 
     dann_tag  = f"_DANN-src{src_key}" if use_dann else ""
+    mask_tag = f"_mask-{args.mask_missing}" if args.mask_missing else ""
     model_str = (
         f"{args.GraphNN_type}"
-        f"_src{src_key}_tgt{tgt_key}{dann_tag}"
+        f"_src{src_key}_tgt{tgt_key}{dann_tag}{mask_tag}"
         f"_poisson{args.N_stars}_Nfiles{len(src_indices)}"
         f"_Nproj{args.N_proj_per_gal}_hlrstd{args.hlr_std}"
     )
@@ -892,6 +914,8 @@ def main() -> None:
     )
 
     if use_dann:
+        # The domain classifier always receives the raw 128-dim embedding, never the
+        # mask-augmented context.
         domain_cls = DomainClassifier(
             in_features     = 128,
             hidden_features = args.dann_domain_hidden,

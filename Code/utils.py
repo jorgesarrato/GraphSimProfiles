@@ -306,7 +306,10 @@ class FlowPosterior(nn.Module):
             labels = labels * data.mask
             context = torch.cat([context, data.mask], dim=1)
             
-        elif self.mask_missing == "BIF":
+        elif self.mask_missing == "BIF": 
+            # TO DO: Probably delay BIF activation until x epochs...
+            # Initially sample imputations from a fixed prior?
+
             # Bayesian Imputation: Use the flow to guess the missing values
             with torch.no_grad():
                 imputed = self.flow.sample(1, context=context).squeeze(1)
@@ -435,6 +438,7 @@ class DANNFlowPosterior(nn.Module):
 
     def log_prob(self, labels: Tensor, data: Data) -> Tensor:
         """Per-sample log p(labels | data). Used during validation."""
+        context = self.embedding_net(data)
         if self.mask_missing == "mask":
             labels = labels * data.mask
             context = torch.cat([context, data.mask], dim=1)
