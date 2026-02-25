@@ -270,6 +270,21 @@ def resolve_indices(
     if limit is not None:
         idx = idx[:limit]
     return idx
+    
+def get_split_indices(label_file, key, test_size=0.1, limit=None):
+    full_idx = resolve_indices(label_file, key)
+    
+    np.random.shuffle(full_idx)
+    
+    split_point = int(len(full_idx) * (1 - test_size))
+    
+    src_indices = full_idx[:split_point]
+    tgt_indices = full_idx[split_point:]
+    
+    if limit is not None:
+        tgt_indices = tgt_indices[:limit]
+        
+    return src_indices, tgt_indices
 
 def load_phase_space(
     data_folder: str,
@@ -754,8 +769,11 @@ def main() -> None:
     src_key = args.dann_source if use_dann else args.train_set
     tgt_key = args.test_set
 
-    src_indices = resolve_indices(label_file, src_key)
-    tgt_indices = resolve_indices(label_file, tgt_key, limit=test_limit)
+    if src_key == tgt_key:
+        src_indices, tgt_indices = get_split_indices(label_file, src_key, limit=test_limit)
+    else:
+        src_indices = resolve_indices(label_file, src_key)
+        tgt_indices = resolve_indices(label_file, tgt_key, limit=test_limit)
 
     mode_tag = "DANN" if use_dann else "Standard"
     print(
