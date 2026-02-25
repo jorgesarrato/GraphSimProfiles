@@ -1,6 +1,19 @@
 """
 train_graphs.py — Train a GNN + Masked Autoregressive Flow posterior for
 stellar mass estimation from graph-structured phase-space data.
+
+Two training modes
+------------------
+Standard (default)
+    train_set  — labelled source of training/validation graphs
+    test_set   — labelled source of test graphs
+
+DANN  (activated by --dann_source KEY)
+    --dann_source  — labelled source domain  (task loss + domain loss)
+    test_set       — target domain: unlabelled during training, then
+                     evaluated as the test set after training
+    train_set      — ignored in DANN mode (keep for positional-arg
+                     compatibility; pass any valid population key)
 """
 
 from __future__ import annotations
@@ -8,7 +21,6 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
-import sys
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -17,89 +29,25 @@ import pandas as pd
 import torch
 from accelerate import Accelerator
 from scipy.interpolate import interp1d
-from torch_geometric.data import Batch
 from torch_geometric.loader.dataloader import Collater
 from tqdm import tqdm
 
 from utils import (
+    DANNFlowPosterior,
+    DomainClassifier,
     FlowPosterior,
     GraphCreator,
     GraphNN,
     build_maf_flow,
+    ganin_lambda_schedule,
     sample_with_timeout,
 )
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train and evaluate GNN + normalizing flow posterior.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Population keys
----------------
-  NIHAO_lo      low-resolution  NIHAO  (eps_dm >  1.0 kpc)
-  NIHAO_hi      high-resolution NIHAO  (eps_dm <= 1.0 kpc)
-  NIHAO_all     all NIHAO galaxies
-  NIHAO_shared  NIHAO galaxies in the eps_dm range shared with AURIGA
-  AURIGA_lo     low-resolution  AURIGA (eps_dm >  0.25 kpc)
-  AURIGA_hi     high-resolution AURIGA (eps_dm <= 0.25 kpc)
-  AURIGA_all    all AURIGA galaxies
-  AURIGA_shared AURIGA galaxies in the eps_dm range shared with NIHAO
-  ALL           every galaxy from both simulations
-  ALL_shared    every galaxy from both simulations, shared range only
-
-  The shared range is computed from the data as:
-    [max(NIHAO_min, AURIGA_min), min(NIHAO_max, AURIGA_max)]
-
-Examples
--------------------
-  # Train on NIHAO low-res Test on NIHAO high-res
-  train_graphs.py train NIHAO_lo NIHAO_hi 1 100 Cheb 8 0
-
-  # Train on all NIHAO, test on all AURIGA
-  train_graphs.py train NIHAO_all AURIGA_all 1 100 Cheb 8 0
-
-  # Train on everything, test on high-res AURIGA
-  train_graphs.py train ALL AURIGA_hi 1 100 Cheb 8 0
-  
-  # Train on NIHAO at shared resolutions, test on AURIGA at shared resolutions
-  train_graphs.py train NIHAO_shared AURIGA_shared 1 100 Cheb 8 0
-
-  # Train on everything at shared resolutions, test on AURIGA shared
-  train_graphs.py train ALL_shared AURIGA_shared 1 100 Cheb 8 0
-""",
-    )
-    parser.add_argument(
-        "mode",
-        choices=["train", "sample", "sampletest"],
-        help="Run mode: train, sample (train+val+test), or sampletest (test only)",
-    )
-    parser.add_argument(
-        "train_set",
-        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all", "NIHAO_shared",
-                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "AURIGA_shared",
-                 "ALL", "ALL_shared"],
-        help="Population to train on (see Population keys below)",
-    )
-    parser.add_argument(
-        "test_set",
-        choices=["NIHAO_lo", "NIHAO_hi", "NIHAO_all", "NIHAO_shared",
-                 "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "AURIGA_shared",
-                 "ALL", "ALL_shared"],
-        help="Population to test on (see Population keys below)",
-    )
-    parser.add_argument(
-        "test_long", type=int, choices=[0, 1],
-        help="Use full test set (1) or first 100 galaxies (0)",
-    )
-    parser.add_argument("N_stars", type=int, help="Expected number of stars (Poisson mean)")
-    parser.add_argument("GraphNN_type", choices=["Cheb", "GCN", "GAT"])
-    parser.add_argument("N_proj_per_gal", type=int, help="Projections per galaxy")
-    parser.add_argument("PCAfilter", type=int, choices=[0, 1], help="PCA-filtered data (0|1)")
-    parser.add_argument(
-        "--hlr_std", type=int, choices=[0, 1], default=1,
-        help="Append hlr/std scalars to embedding (default: 1)",
-    )
-    return parser.parse_args()
+POPULATION_KEYS = [
+    "NIHAO_lo", "NIHAO_hi", "NIHAO_all", "NIHAO_shared",
+    "AURIGA_lo", "AURIGA_hi", "AURIGA_all", "AURIGA_shared",
+    "ALL", "ALL_shared",
+]
 
 GRAPH_LAYER_CONFIGS: dict[str, dict] = {
     "Cheb": {
@@ -116,10 +64,10 @@ GRAPH_LAYER_CONFIGS: dict[str, dict] = {
     },
 }
 
-KM_TO_M = 1e3
-KPC_TO_M = 3.086e19
+KM_TO_M    = 1e3
+KPC_TO_M   = 3.086e19
 KG_TO_MSUN = 1.0 / (2e30)
-G_SI = 6.6743e-11  # m³ kg⁻¹ s⁻²
+G_SI       = 6.6743e-11   # m^3 kg^-1 s^-2
 
 ESTIMATOR_COEFFICIENTS = {
     "Walker":   2.5,
@@ -148,10 +96,98 @@ GENINA_DOWN = dict(
         0.7691,  0.7400,  0.7109,  0.6927],
 )
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train and evaluate GNN + normalizing flow posterior.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Population keys
+---------------
+  NIHAO_lo      low-resolution  NIHAO  (eps_dm >  1.0 kpc)
+  NIHAO_hi      high-resolution NIHAO  (eps_dm <= 1.0 kpc)
+  NIHAO_all     all NIHAO galaxies
+  NIHAO_shared  NIHAO galaxies in the eps_dm range shared with AURIGA
+  AURIGA_lo     low-resolution  AURIGA (eps_dm >  0.25 kpc)
+  AURIGA_hi     high-resolution AURIGA (eps_dm <= 0.25 kpc)
+  AURIGA_all    all AURIGA galaxies
+  AURIGA_shared AURIGA galaxies in the eps_dm range shared with NIHAO
+  ALL           every galaxy from both simulations
+  ALL_shared    every galaxy from both simulations, shared range only
+
+  Shared range: [max(NIHAO_min, AURIGA_min), min(NIHAO_max, AURIGA_max)]
+  computed directly from eps_dm values in the data.
+
+Standard examples
+-----------------
+  # NIHAO low-res -> NIHAO high-res
+  train_graphs.py train NIHAO_lo NIHAO_hi 1 100 Cheb 8 0
+
+  # all NIHAO -> all AURIGA
+  train_graphs.py train NIHAO_all AURIGA_all 1 100 Cheb 8 0
+
+  # shared-resolution NIHAO -> shared-resolution AURIGA
+  train_graphs.py train NIHAO_shared AURIGA_shared 1 100 Cheb 8 0
+
+DANN examples
+-------------
+  # source=NIHAO_all, target/test=AURIGA_all
+  train_graphs.py train NIHAO_all AURIGA_all 1 100 Cheb 8 0 --dann_source NIHAO_all
+
+  # source=NIHAO_shared, target/test=AURIGA_shared
+  train_graphs.py train NIHAO_shared AURIGA_shared 1 100 Cheb 8 0 --dann_source NIHAO_shared
+""",
+    )
+    parser.add_argument(
+        "mode", choices=["train", "sample", "sampletest"],
+        help="train, sample (train+val+test), or sampletest (test only)",
+    )
+    parser.add_argument(
+        "train_set", choices=POPULATION_KEYS,
+        help="Population to train on in standard mode (ignored with --dann_source)",
+    )
+    parser.add_argument(
+        "test_set", choices=POPULATION_KEYS,
+        help="Population to test on; also the DANN target domain when --dann_source is set",
+    )
+    parser.add_argument(
+        "test_long", type=int, choices=[0, 1],
+        help="Full test set (1) or first 100 galaxies (0)",
+    )
+    parser.add_argument("N_stars",         type=int,                 help="Expected number of stars (Poisson mean)")
+    parser.add_argument("GraphNN_type",    choices=["Cheb", "GCN", "GAT"])
+    parser.add_argument("N_proj_per_gal",  type=int,                 help="Projections per galaxy")
+    parser.add_argument("PCAfilter",       type=int, choices=[0, 1], help="PCA-filtered data (0|1)")
+    parser.add_argument(
+        "--hlr_std", type=int, choices=[0, 1], default=1,
+        help="Append hlr/std scalars to embedding (default: 1)",
+    )
+    # DANN arguments
+    parser.add_argument(
+        "--dann_source", choices=POPULATION_KEYS, default=None, metavar="KEY",
+        help=(
+            "Enable DANN. KEY = labelled source domain. "
+            "test_set becomes the unlabelled target domain during training "
+            "and the evaluated test set after training."
+        ),
+    )
+    parser.add_argument(
+        "--dann_lambda", type=float, default=1.0,
+        help="Maximum GRL reversal strength lambda (default: 1.0)",
+    )
+    parser.add_argument(
+        "--dann_gamma", type=float, default=10.0,
+        help="Steepness of the Ganin lambda schedule (default: 10.0)",
+    )
+    parser.add_argument(
+        "--dann_domain_hidden", type=int, default=64,
+        help="Hidden width of the domain-classifier MLP (default: 64)",
+    )
+    return parser.parse_args()
+
 
 def load_label_file(data_folder: str, pca_filter: bool) -> pd.DataFrame:
     """Read the label CSV and annotate each row with its simulation origin."""
-    suffix = "PCAfilt" if pca_filter else "PCAnofilt"
+    suffix   = "PCAfilt" if pca_filter else "PCAnofilt"
     csv_path = (
         f"/net/debut/project/jsarrato/Paper-GraphSimProfiles/work/"
         f"proj_data_NIHAO_and_AURIGA_{suffix}_samplearr.csv"
@@ -164,24 +200,18 @@ def load_label_file(data_folder: str, pca_filter: bool) -> pd.DataFrame:
 def shared_eps_dm_range(label_file: pd.DataFrame) -> tuple[float, float]:
     """Return the overlapping eps_dm range between NIHAO and AURIGA.
 
-    Computes [max(nh_min, au_min), min(nh_max, au_max)] from the actual
-    data, so no hard-coded resolution thresholds are needed.
-
-    Raises ValueError if the two simulations share no eps_dm range.
+    Computes [max(nh_min, au_min), min(nh_max, au_max)] from the actual data.
+    Raises ValueError if there is no overlap.
     """
     nh_eps = label_file.loc[label_file["sim"] == 0, "eps_dm"]
     au_eps = label_file.loc[label_file["sim"] == 1, "eps_dm"]
-
     lo = max(nh_eps.min(), au_eps.min())
     hi = min(nh_eps.max(), au_eps.max())
-
     if lo >= hi:
         raise ValueError(
-            f"No overlapping eps_dm range between NIHAO "
-            f"[{nh_eps.min():.3f}, {nh_eps.max():.3f}] and AURIGA "
-            f"[{au_eps.min():.3f}, {au_eps.max():.3f}]."
+            f"No overlapping eps_dm range: NIHAO [{nh_eps.min():.3f}, {nh_eps.max():.3f}], "
+            f"AURIGA [{au_eps.min():.3f}, {au_eps.max():.3f}]."
         )
-
     return lo, hi
 
 def population_indices(label_file: pd.DataFrame, key: str) -> np.ndarray:
@@ -189,18 +219,21 @@ def population_indices(label_file: pd.DataFrame, key: str) -> np.ndarray:
 
     Population keys
     ---------------
-    NIHAO_lo   low-resolution  NIHAO  (eps_dm >  1.0 kpc)
-    NIHAO_hi   high-resolution NIHAO  (eps_dm <= 1.0 kpc)
-    NIHAO_all  all NIHAO galaxies
-    AURIGA_lo  low-resolution  AURIGA (eps_dm >  0.25 kpc)
-    AURIGA_hi  high-resolution AURIGA (eps_dm <= 0.25 kpc)
-    AURIGA_all all AURIGA galaxies
-    ALL        every galaxy from both simulations
+    NIHAO_lo      eps_dm >  1.0 kpc, NIHAO
+    NIHAO_hi      eps_dm <= 1.0 kpc, NIHAO
+    NIHAO_all     all NIHAO
+    NIHAO_shared  NIHAO within the shared eps_dm range
+    AURIGA_lo     eps_dm >  0.25 kpc, AURIGA
+    AURIGA_hi     eps_dm <= 0.25 kpc, AURIGA
+    AURIGA_all    all AURIGA
+    AURIGA_shared AURIGA within the shared eps_dm range
+    ALL           everything
+    ALL_shared    everything within the shared eps_dm range
     """
     is_nihao  = label_file["sim"] == 0
     is_auriga = label_file["sim"] == 1
 
-    masks = {
+    masks: dict[str, pd.Series] = {
         "NIHAO_lo":   is_nihao  & (label_file["eps_dm"] >  1.0),
         "NIHAO_hi":   is_nihao  & (label_file["eps_dm"] <= 1.0),
         "NIHAO_all":  is_nihao,
@@ -210,72 +243,78 @@ def population_indices(label_file: pd.DataFrame, key: str) -> np.ndarray:
         "ALL":        pd.Series(True, index=label_file.index),
     }
 
+
+    if "_shared" in key:
+        lo, hi    = shared_eps_dm_range(label_file)
+        in_shared = (label_file["eps_dm"] >= lo) & (label_file["eps_dm"] <= hi)
+        masks["NIHAO_shared"]  = is_nihao  & in_shared
+        masks["AURIGA_shared"] = is_auriga & in_shared
+        masks["ALL_shared"]    = in_shared
+
     if key not in masks:
-        raise ValueError(
-            f"Unknown population key '{key}'. Valid keys: {list(masks.keys())}"
-        )
+        raise ValueError(f"Unknown population key '{key}'. Valid: {POPULATION_KEYS}")
 
     return np.array(label_file[masks[key]]["i_index"], dtype=int)
 
-def resolve_file_indices(
+
+def resolve_indices(
     label_file: pd.DataFrame,
-    train_set: str,
-    test_set: str,
-    test_long: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (train_indices, test_indices) for the requested populations."""
-    train_idx = population_indices(label_file, train_set)
-    test_idx  = population_indices(label_file, test_set)
+    key: str,
+    limit: int | None = None,
+) -> np.ndarray:
 
-    if not test_long:
-        test_idx = test_idx[:100]
+    if "_shared" in key:
+        lo, hi = shared_eps_dm_range(label_file)
+        print(f"  Shared eps_dm range for '{key}': [{lo:.4f}, {hi:.4f}] kpc")
+    idx = population_indices(label_file, key)
+    if limit is not None:
+        idx = idx[:limit]
+    return idx
 
-    return train_idx, test_idx
-    
 def load_phase_space(
     data_folder: str,
-    file_indices_train: np.ndarray,
-    file_indices_test: np.ndarray,
+    file_indices_src: np.ndarray,
+    file_indices_tgt: np.ndarray,
     n_proj_per_gal: int,
     nstars_arr: np.ndarray,
     label_mass_radii_frac: np.ndarray,
     mass_estim_radii_frac: np.ndarray,
 ) -> dict:
-    """Read all galaxy files and extract stellar features and mass labels.
+    """Read all galaxy files for source and target sets.
 
-    Returns a dict with keys:
+    Returns dict with keys:
         positions, velocities, labels, file_indices,
         hlrs, stds, estimator_masses, train_and_val_size
     """
-    all_indices = np.concatenate([file_indices_train, file_indices_test])
-    len_train = len(file_indices_train)
+    all_indices = np.concatenate([file_indices_src, file_indices_tgt])
+    len_src     = len(file_indices_src)
 
     positions, velocities, labels = [], [], []
-    file_indices_out = []
-    hlrs, stds, estimator_masses = [], [], []
-    train_and_val_size = None
+    file_indices_out              = []
+    hlrs, stds, estimator_masses  = [], [], []
+    train_and_val_size            = None
 
     for i, idx in enumerate(tqdm(all_indices, desc="Reading data")):
         masses_name = data_folder + f"mass_interp{idx}.npz"
         posvel_name = data_folder + f"posvel_{idx}.pkl"
 
-        mass_data = np.load(masses_name)
+        mass_data         = np.load(masses_name)
         mass_interpolator = interp1d(mass_data["x"], mass_data["y"])
-        posvel = torch.load(posvel_name, weights_only=False)
+        posvel            = torch.load(posvel_name, weights_only=False)
 
         proj_indices = np.random.choice(len(posvel), n_proj_per_gal)
 
         for j, proj_idx in enumerate(proj_indices):
             nstars = nstars_arr[i * n_proj_per_gal + j]
-            data = posvel[proj_idx]
+            data   = posvel[proj_idx]
 
-            rxy = np.linalg.norm(data[:nstars, :2], axis=1)
-            hlr = np.median(rxy)
+            rxy  = np.linalg.norm(data[:nstars, :2], axis=1)
+            hlr  = np.median(rxy)
             vstd = np.std(data[:nstars, -1])
 
             try:
                 masses_idx = np.log10(mass_interpolator(label_mass_radii_frac * hlr))
-                estim = mass_interpolator(mass_estim_radii_frac * hlr)
+                estim      = mass_interpolator(mass_estim_radii_frac * hlr)
             except Exception:
                 continue
 
@@ -290,32 +329,32 @@ def load_phase_space(
             stds.append(vstd)
             estimator_masses.append(estim)
 
-        if i == len_train - 1:
+        if i == len_src - 1:
             train_and_val_size = len(labels)
 
     return dict(
-        positions=positions,
-        velocities=velocities,
-        labels=labels,
-        file_indices=np.array(file_indices_out),
-        hlrs=np.array(hlrs),
-        stds=np.array(stds),
-        estimator_masses=np.array(estimator_masses),
-        train_and_val_size=train_and_val_size,
+        positions          = positions,
+        velocities         = velocities,
+        labels             = labels,
+        file_indices       = np.array(file_indices_out),
+        hlrs               = np.array(hlrs),
+        stds               = np.array(stds),
+        estimator_masses   = np.array(estimator_masses),
+        train_and_val_size = train_and_val_size,
     )
 
 def build_graph_list(
     data: dict,
     graph_creator: GraphCreator,
 ) -> tuple[list, np.ndarray, np.ndarray]:
-    """Apply *graph_creator* to every sample; return graphs, hlrs, stds."""
+    """Apply graph_creator to every sample; return (graphs, hlrs, stds)."""
     graphs, hlrs, stds = [], [], []
 
     for i in tqdm(range(len(data["labels"])), desc="Building graphs"):
         graph = graph_creator(
-            positions=data["positions"][i],
-            velocities=data["velocities"][i],
-            labels=data["labels"][i],
+            positions  = data["positions"][i],
+            velocities = data["velocities"][i],
+            labels     = data["labels"][i],
         )
         graph.hlr = torch.tensor(
             torch.quantile(10 ** graph.x[:, 0], 0.5), dtype=torch.float32
@@ -323,7 +362,6 @@ def build_graph_list(
         graph.std = torch.tensor(
             torch.std(graph.x[:, 1]), dtype=torch.float32
         ).reshape(1, 1)
-
         hlrs.append(float(graph.hlr))
         stds.append(float(graph.std))
         graphs.append(graph)
@@ -346,43 +384,66 @@ def train_val_split(
     file_indices: np.ndarray,
     val_fraction: float = 0.2,
 ) -> tuple[list, list, np.ndarray, np.ndarray]:
-    """Split *graphs* into train and val sets by galaxy file (no data leakage).
+    """Split graphs into train/val by galaxy file (no leakage across projections).
 
     Returns (train_graphs, val_graphs, train_mask, val_mask).
     """
     unique_files = np.unique(file_indices)
-    n_val = max(1, int(val_fraction * len(unique_files)))
-    val_files = np.random.choice(unique_files, n_val, replace=False)
-
-    val_mask = np.isin(file_indices, val_files)
-    train_mask = ~val_mask
-
+    n_val        = max(1, int(val_fraction * len(unique_files)))
+    val_files    = np.random.choice(unique_files, n_val, replace=False)
+    val_mask     = np.isin(file_indices, val_files)
+    train_mask   = ~val_mask
     train_graphs = [g for g, m in zip(graphs, train_mask) if m]
     val_graphs   = [g for g, m in zip(graphs, val_mask)   if m]
     return train_graphs, val_graphs, train_mask, val_mask
 
-def make_data_loaders(
-    train_graphs: list,
-    val_graphs: list,
-    batch_size: int = 64,
+def _make_loader(
+    graphs: list,
+    batch_size: int,
+    shuffle: bool,
     num_workers: int = 1,
-) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    """Create PyTorch DataLoaders that return (batch, labels) tuples."""
-    collater = Collater(train_graphs)
+) -> torch.utils.data.DataLoader:
+    collater = Collater(graphs)
 
     def collate_fn(batch):
         batch = collater(batch)
         return batch, batch.y
 
-    train_loader = torch.utils.data.DataLoader(
-        train_graphs, batch_size=batch_size, shuffle=True,
+    return torch.utils.data.DataLoader(
+        graphs, batch_size=batch_size, shuffle=shuffle,
         num_workers=num_workers, collate_fn=collate_fn,
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_graphs, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, collate_fn=collate_fn,
+
+def make_data_loaders(
+    train_graphs: list,
+    val_graphs: list,
+    batch_size: int = 64,
+) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    return (
+        _make_loader(train_graphs, batch_size, shuffle=True),
+        _make_loader(val_graphs,   batch_size, shuffle=False),
     )
-    return train_loader, val_loader
+
+def make_dann_loaders(
+    src_train: list,
+    src_val: list,
+    tgt_all: list,
+    batch_size: int = 64,
+) -> tuple[
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+]:
+    """Return (src_train_loader, src_val_loader, tgt_loader).
+
+    The target loader uses the same collate_fn so that graphs
+    can be evaluated after training; labels are never used in the DANN step.
+    """
+    return (
+        _make_loader(src_train, batch_size, shuffle=True),
+        _make_loader(src_val,   batch_size, shuffle=False),
+        _make_loader(tgt_all,   batch_size, shuffle=True),
+    )
 
 def train_posterior(
     posterior: FlowPosterior,
@@ -393,44 +454,43 @@ def train_posterior(
     max_epochs: int = 500,
     stop_after_epochs: int = 10,
 ) -> dict:
-    """Train the FlowPosterior with early stopping.
+    """Train FlowPosterior with early stopping on validation log-prob.
 
-    Returns a dict with ``"training_log_probs"`` and ``"validation_log_probs"``
-    lists (one entry per epoch), mirroring the ili summary format.
+    Returns dict with training_log_probs and validation_log_probs.
     """
     posterior.to(device)
     optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "max", factor=0.5, patience=5)
-
-    best_val_lp = float("-inf")
-    epochs_no_improve = 0
-    train_log_probs, val_log_probs = [], []
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, "max", factor=0.5, patience=5
+    )
+    best_val_lp    = float("-inf")
+    epochs_no_impr = 0
+    train_lps, val_lps = [], []
 
     for epoch in range(max_epochs):
         posterior.train()
-        epoch_train_lp = []
+        epoch_train = []
         for batch, labels in train_loader:
-            batch = batch.to(device)
+            batch  = batch.to(device)
             labels = labels.to(device).float()
             optimizer.zero_grad()
             lp = posterior.log_prob(labels, batch).mean()
             (-lp).backward()
             optimizer.step()
-            epoch_train_lp.append(lp.item())
+            epoch_train.append(lp.item())
 
         posterior.eval()
-        epoch_val_lp = []
+        epoch_val = []
         with torch.no_grad():
             for batch, labels in val_loader:
-                batch = batch.to(device)
+                batch  = batch.to(device)
                 labels = labels.to(device).float()
-                lp = posterior.log_prob(labels, batch).mean()
-                epoch_val_lp.append(lp.item())
+                epoch_val.append(posterior.log_prob(labels, batch).mean().item())
 
-        mean_train = float(np.mean(epoch_train_lp))
-        mean_val   = float(np.mean(epoch_val_lp))
-        train_log_probs.append(mean_train)
-        val_log_probs.append(mean_val)
+        mean_train = float(np.mean(epoch_train))
+        mean_val   = float(np.mean(epoch_val))
+        train_lps.append(mean_train)
+        val_lps.append(mean_val)
         scheduler.step(mean_val)
 
         print(
@@ -440,26 +500,153 @@ def train_posterior(
         )
 
         if mean_val > best_val_lp:
-            best_val_lp = mean_val
-            epochs_no_improve = 0
-
+            best_val_lp    = mean_val
+            epochs_no_impr = 0
         else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= stop_after_epochs:
+            epochs_no_impr += 1
+            if epochs_no_impr >= stop_after_epochs:
                 print(f"Early stopping at epoch {epoch + 1}.")
                 break
 
-    return {"training_log_probs": train_log_probs, "validation_log_probs": val_log_probs}
+    return {"training_log_probs": train_lps, "validation_log_probs": val_lps}
+
+def train_dann_posterior(
+    posterior: DANNFlowPosterior,
+    src_train_loader: torch.utils.data.DataLoader,
+    src_val_loader: torch.utils.data.DataLoader,
+    tgt_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    learning_rate: float = 4e-4,
+    max_epochs: int = 500,
+    stop_after_epochs: int = 10,
+    lambda_max: float = 1.0,
+    gamma: float = 10.0,
+) -> dict:
+    """DANN training with early stopping on source-domain validation log-prob.
+
+    1. Ramp lambda via the Ganin sigmoid schedule (0 -> lambda_max).
+    2. For each source batch, draw one target batch,
+    compute task + domain losses, back-propagate
+    3. Validate task log-prob on the source validation split only.
+
+    Returns dict with:
+        training_log_probs      – per-epoch source task log-probs
+        validation_log_probs    – per-epoch source val log-probs
+        training_domain_losses  – per-epoch domain BCE losses
+        training_domain_accs    – per-epoch domain classifier accuracy
+    """
+    posterior.to(device)
+    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, "max", factor=0.5, patience=5
+    )
+    best_val_lp    = float("-inf")
+    epochs_no_impr = 0
+    train_lps, val_lps         = [], []
+    domain_losses, domain_accs = [], []
+
+    for epoch in range(max_epochs):
+        lam = ganin_lambda_schedule(epoch, max_epochs, gamma) * lambda_max
+        posterior.domain_classifier.set_lambda(lam)
+
+        posterior.train()
+        tgt_iter = iter(tgt_loader)
+        epoch_task, epoch_dom, epoch_acc = [], [], []
+
+        for src_batch, src_labels in src_train_loader:
+            try:
+                tgt_batch, _ = next(tgt_iter)
+            except StopIteration:
+                tgt_iter     = iter(tgt_loader)
+                tgt_batch, _ = next(tgt_iter)
+
+            src_batch  = src_batch.to(device)
+            src_labels = src_labels.to(device).float()
+            tgt_batch  = tgt_batch.to(device)
+
+            optimizer.zero_grad()
+            task_loss, domain_loss, domain_acc = posterior.dann_forward(
+                src_batch, src_labels, tgt_batch
+            )
+            (task_loss + domain_loss).backward()
+            optimizer.step()
+
+            epoch_task.append(task_loss.item())
+            epoch_dom.append(domain_loss.item())
+            epoch_acc.append(domain_acc.item())
+
+        posterior.eval()
+        epoch_val = []
+        with torch.no_grad():
+            for batch, labels in src_val_loader:
+                batch  = batch.to(device)
+                labels = labels.to(device).float()
+                epoch_val.append(posterior.log_prob(labels, batch).mean().item())
+
+        mean_task   = float(np.mean(epoch_task))
+        mean_domain = float(np.mean(epoch_dom))
+        mean_acc    = float(np.mean(epoch_acc))
+        mean_val    = float(np.mean(epoch_val))
+
+        # Store -task_loss so sign convention matches standard mode (higher = better)
+        train_lps.append(-mean_task)
+        val_lps.append(mean_val)
+        domain_losses.append(mean_domain)
+        domain_accs.append(mean_acc)
+        scheduler.step(mean_val)
+
+        print(
+            f"Epoch {epoch + 1:4d} | lambda={lam:.3f} | "
+            f"task: {mean_task:.4f} | domain: {mean_domain:.4f} | "
+            f"dom-acc: {mean_acc:.3f} | val: {mean_val:.4f}"
+        )
+
+        if mean_val > best_val_lp:
+            best_val_lp    = mean_val
+            epochs_no_impr = 0
+        else:
+            epochs_no_impr += 1
+            if epochs_no_impr >= stop_after_epochs:
+                print(f"Early stopping at epoch {epoch + 1}.")
+                break
+
+    return {
+        "training_log_probs":     train_lps,
+        "validation_log_probs":   val_lps,
+        "training_domain_losses": domain_losses,
+        "training_domain_accs":   domain_accs,
+    }
 
 def plot_training_curves(summary: dict, save_path: str) -> None:
-    fig, ax = plt.subplots(figsize=(6, 4))
+    """Task log-prob panel; adds domain loss/acc panel for DANN runs."""
+    has_dann = "training_domain_losses" in summary
+    ncols    = 2 if has_dann else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4))
+    ax1 = axes[0] if has_dann else axes
+
     colors = list(mcolors.TABLEAU_COLORS)
-    ax.plot(summary["training_log_probs"],   ls="-",  label="train", c=colors[0])
-    ax.plot(summary["validation_log_probs"], ls="--", label="val",   c=colors[0])
-    ax.set_xlim(0)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Log probability")
-    ax.legend()
+    ax1.plot(summary["training_log_probs"],   ls="-",  label="train", c=colors[0])
+    ax1.plot(summary["validation_log_probs"], ls="--", label="val",   c=colors[0])
+    ax1.set_xlim(0)
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Log probability")
+    ax1.set_title("Task (flow log-prob)")
+    ax1.legend()
+
+    if has_dann:
+        ax2  = axes[1]
+        ax2r = ax2.twinx()
+        ax2.plot( summary["training_domain_losses"], label="domain loss", c=colors[1])
+        ax2r.plot(summary["training_domain_accs"],   label="domain acc",  c=colors[2], ls="--")
+        ax2.set_xlim(0)
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Domain BCE loss")
+        ax2r.set_ylabel("Domain accuracy")
+        ax2.set_title("Domain adversary")
+        lines  = ax2.get_lines() + ax2r.get_lines()
+        ax2.legend(lines, [l.get_label() for l in lines])
+
+    fig.tight_layout()
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
 
@@ -468,10 +655,10 @@ def compute_ratio_stats(
     samples: np.ndarray,
     truths: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (median, p16, p84) of predicted/true mass ratio across the sample."""
+    """Return (median, p16, p84) of M_pred/M_true across galaxies."""
     medians = 10 ** np.nanmedian(samples, axis=0) / (10 ** truths)
     return (
-        np.nanmedian(medians, axis=0),
+        np.nanmedian(medians,      axis=0),
         np.nanpercentile(medians, 16, axis=0),
         np.nanpercentile(medians, 84, axis=0),
     )
@@ -480,15 +667,14 @@ def compute_ratio_stats(
 def plot_mass_ratios(
     label_mass_radii_frac: np.ndarray,
     ratio_stats: dict[str, tuple],
-    classical_rel: dict[str, tuple],
+    classical_rel: dict[str, np.ndarray],
     sim: str,
     nstars: int,
     save_path: str,
     capsize: int = 5,
     markersize: int = 3,
 ) -> None:
-    """Plot predicted/true mass ratio vs. r/R_h for all splits + estimators."""
-    marker_styles = {"Walker": "o", "Wolf": "d", "Amorisco": "*", "Campbell": "<", "Errani": "^"}
+    marker_styles   = {"Walker": "o", "Wolf": "d", "Amorisco": "*", "Campbell": "<", "Errani": "^"}
     estimator_radii = {"Walker": 1.0, "Wolf": 4/3, "Amorisco": 1.7, "Campbell": 1.8, "Errani": 1.8}
 
     fig, ax = plt.subplots()
@@ -498,20 +684,19 @@ def plot_mass_ratios(
         ax.plot(label_mass_radii_frac, med, label=split)
         ax.fill_between(label_mass_radii_frac, p16, p84, alpha=0.5)
 
-    # Genina+20 reference
-    ax.plot(10 ** np.array(GENINA_MED["x"]), GENINA_MED["y"], ls=":", color="darkgray", label="Genina+20")
+    ax.plot(10 ** np.array(GENINA_MED["x"]),  GENINA_MED["y"],  ls=":", color="darkgray", label="Genina+20")
     ax.plot(10 ** np.array(GENINA_UP["x"]),   GENINA_UP["y"],   ls=":", color="darkgray")
     ax.plot(10 ** np.array(GENINA_DOWN["x"]), GENINA_DOWN["y"], ls=":", color="darkgray")
 
     for name, rel_values in classical_rel.items():
-        r = estimator_radii[name]
+        r     = estimator_radii[name]
         med_r = np.nanmedian(rel_values)
-        err = np.array([
+        err   = np.array([
             [med_r - np.nanpercentile(rel_values, 16)],
             [np.nanpercentile(rel_values, 84) - med_r],
         ])
-        ax.errorbar(r, med_r, err, capsize=capsize, fmt=marker_styles[name],
-                    markersize=markersize, label=name)
+        ax.errorbar(r, med_r, err, capsize=capsize,
+                    fmt=marker_styles[name], markersize=markersize, label=name)
 
     ax.set_xlabel(r"r/R$_{\rm h}$")
     ax.set_ylabel(r"M(<r)$_{\rm pred}$/M(<r)$_{\rm true}$")
@@ -522,17 +707,16 @@ def plot_mass_ratios(
 
 
 def plot_label_distributions(
-    labels_train_val: np.ndarray,
-    labels_test: np.ndarray,
-    labels_test_filtered: np.ndarray,
+    labels_src: np.ndarray,
+    labels_tgt: np.ndarray,
+    labels_tgt_filtered: np.ndarray,
     save_dir: str,
 ) -> None:
-    """Save per-feature distribution plots to *save_dir*."""
-    for i in range(labels_train_val.shape[1]):
+    for i in range(labels_src.shape[1]):
         fig, ax = plt.subplots()
-        ax.hist(labels_train_val[:, i],      bins=30, density=True, alpha=0.5, label="Train/Val")
-        ax.hist(labels_test_filtered[:, i],  bins=30, density=True, alpha=0.5, label="Test (masked)")
-        ax.hist(labels_test[:, i],           bins=30, density=True, alpha=0.5, label="Test (full)")
+        ax.hist(labels_src[:, i],          bins=30, density=True, alpha=0.5, label="Source (train/val)")
+        ax.hist(labels_tgt_filtered[:, i], bins=30, density=True, alpha=0.5, label="Target/test (filtered)")
+        ax.hist(labels_tgt[:, i],          bins=30, density=True, alpha=0.5, label="Target/test (all)")
         ax.set_xlabel(f"Feature {i}")
         ax.set_ylabel("Density")
         ax.legend()
@@ -541,14 +725,14 @@ def plot_label_distributions(
         plt.close(fig)
 
 def main() -> None:
-    args = parse_args()
-
+    args        = parse_args()
+    use_dann    = args.dann_source is not None
     test_long   = bool(args.test_long)
     pca_filter  = bool(args.PCAfilter)
     use_hlr_std = bool(args.hlr_std)
 
     accelerator = Accelerator()
-    device = accelerator.device
+    device      = accelerator.device
 
     seed = 22133
     np.random.seed(seed)
@@ -560,129 +744,157 @@ def main() -> None:
     )
     main_work_dir = "/net/deimos/scratch/jsarrato/Wolf_for_FIRE/work/"
 
-    model_str = (
-        f"{args.GraphNN_type}"
-        f"_train{args.train_set}_test{args.test_set}"
-        f"_poisson{args.N_stars}_Nfiles{{len_train}}"
-        f"_Nproj{args.N_proj_per_gal}_hlrstd{args.hlr_std}"
-    )
-
-    label_file = load_label_file(data_folder, pca_filter)
-    train_indices, test_indices = resolve_file_indices(
-        label_file, args.train_set, args.test_set, test_long
-    )
-    print(f"Train galaxies: {len(train_indices)} | Test galaxies: {len(test_indices)}")
-
+    label_file            = load_label_file(data_folder, pca_filter)
     label_mass_radii_frac = np.arange(0.6, 2.6, 0.2)
     mass_estim_radii_frac = np.array([1.0, 4/3, 1.67, 1.77, 1.8])
-    n_labels = len(label_mass_radii_frac)
+    n_labels              = len(label_mass_radii_frac)
 
-    n_total = (len(train_indices) + len(test_indices)) * args.N_proj_per_gal
+    test_limit = None if test_long else 100
+
+    src_key = args.dann_source if use_dann else args.train_set
+    tgt_key = args.test_set
+
+    src_indices = resolve_indices(label_file, src_key)
+    tgt_indices = resolve_indices(label_file, tgt_key, limit=test_limit)
+
+    mode_tag = "DANN" if use_dann else "Standard"
+    print(
+        f"{mode_tag}  |  source: {src_key} ({len(src_indices)} galaxies)  |  "
+        f"{'target' if use_dann else 'test'}: {tgt_key} ({len(tgt_indices)} galaxies)"
+    )
+
+    n_total    = (len(src_indices) + len(tgt_indices)) * args.N_proj_per_gal
     nstars_arr = np.random.poisson(args.N_stars, size=n_total)
 
-    raw = load_phase_space(
-        data_folder, train_indices, test_indices,
+    raw      = load_phase_space(
+        data_folder, src_indices, tgt_indices,
         args.N_proj_per_gal, nstars_arr,
         label_mass_radii_frac, mass_estim_radii_frac,
     )
+    src_size = raw["train_and_val_size"]   # projection-level boundary
 
-    train_and_val_size = raw["train_and_val_size"]
-    len_train = len(train_indices)
-
-    model_folder = os.path.join(
-        main_work_dir, "Graph+Flow_Mocks_NH/new/",
-        model_str.format(len_train=len_train),
+    dann_tag  = f"_DANN-src{src_key}" if use_dann else ""
+    model_str = (
+        f"{args.GraphNN_type}"
+        f"_src{src_key}_tgt{tgt_key}{dann_tag}"
+        f"_poisson{args.N_stars}_Nfiles{len(src_indices)}"
+        f"_Nproj{args.N_proj_per_gal}_hlrstd{args.hlr_std}"
     )
+    model_folder = os.path.join(main_work_dir, "Graph+Flow_Mocks_NH/new/", model_str)
     os.makedirs(model_folder, exist_ok=True)
 
-    labels_all      = np.array(raw["labels"])
-    labels_train_val = labels_all[:train_and_val_size]
-    labels_test      = labels_all[train_and_val_size:]
+    labels_all = np.array(raw["labels"])
+    labels_src = labels_all[:src_size]
+    labels_tgt = labels_all[src_size:]
 
-    hlrs_train_val  = raw["hlrs"][:train_and_val_size]
-    stds_train_val  = raw["stds"][:train_and_val_size]
-    hlrs_test       = raw["hlrs"][train_and_val_size:]
-    stds_test       = raw["stds"][train_and_val_size:]
+    hlrs_src = raw["hlrs"][:src_size]
+    stds_src = raw["stds"][:src_size]
+    hlrs_tgt = raw["hlrs"][src_size:]
+    stds_tgt = raw["stds"][src_size:]
 
-    mask_test = np.ones(len(labels_test), dtype=bool)
-    for dim in range(labels_test.shape[1]):
-        lo, hi = labels_train_val[:, dim].min(), labels_train_val[:, dim].max()
-        mask_test &= (labels_test[:, dim] > lo) & (labels_test[:, dim] < hi)
-    mask_test &= (hlrs_test > hlrs_train_val.min()) & (hlrs_test < hlrs_train_val.max())
-    mask_test &= (stds_test > stds_train_val.min()) & (stds_test < stds_train_val.max())
-    print(f"Test points after filtering: {mask_test.sum()} / {len(mask_test)}")
+    # Filter target projections to the source distribution
+    mask_test = np.ones(len(labels_tgt), dtype=bool)
+    for dim in range(labels_tgt.shape[1]):
+        lo, hi = labels_src[:, dim].min(), labels_src[:, dim].max()
+        mask_test &= (labels_tgt[:, dim] > lo) & (labels_tgt[:, dim] < hi)
+    mask_test &= (hlrs_tgt > hlrs_src.min()) & (hlrs_tgt < hlrs_src.max())
+    mask_test &= (stds_tgt > stds_src.min()) & (stds_tgt < stds_src.max())
+    print(f"Test projections after filtering: {mask_test.sum()} / {len(mask_test)}")
 
-    labels_test_filtered = labels_test[mask_test]
+    labels_tgt_filtered = labels_tgt[mask_test]
+    plot_label_distributions(labels_src, labels_tgt, labels_tgt_filtered, model_folder)
 
-    plot_label_distributions(labels_train_val, labels_test, labels_test_filtered, model_folder)
 
-    k_neighbors = min(args.N_stars, 20)
+    k_neighbors   = min(args.N_stars, 20)
     graph_creator = GraphCreator(
-        graph_type="KNNGraph",
-        graph_config={"k": k_neighbors, "force_undirected": True, "loop": True},
-        use_log_radius=True,
+        graph_type    = "KNNGraph",
+        graph_config  = {"k": k_neighbors, "force_undirected": True, "loop": True},
+        use_log_radius= True,
     )
 
     graphs_all, hlrs_from_graphs, stds_from_graphs = build_graph_list(raw, graph_creator)
 
-    estim_masses   = raw["estimator_masses"]
-    stds_combined  = stds_from_graphs  # shape (N_total,)
-    hlrs_combined  = hlrs_from_graphs
+    graphs_src     = graphs_all[:src_size]
+    graphs_tgt_all = graphs_all[src_size:]
+    graphs_test    = [g for g, m in zip(graphs_tgt_all, mask_test) if m]
 
-    classical_masses_train = compute_classical_estimators(
-        stds_combined[:train_and_val_size], hlrs_combined[:train_and_val_size]
+    estim_masses         = raw["estimator_masses"]
+    classical_masses_src = compute_classical_estimators(
+        stds_from_graphs[:src_size], hlrs_from_graphs[:src_size]
     )
     classical_rel = {
-        "Walker":   classical_masses_train["Walker"]   / estim_masses[:train_and_val_size, 0],
-        "Wolf":     classical_masses_train["Wolf"]     / estim_masses[:train_and_val_size, 1],
-        "Amorisco": classical_masses_train["Amorisco"] / estim_masses[:train_and_val_size, 2],
-        "Errani":   classical_masses_train["Errani"]   / estim_masses[:train_and_val_size, 3],
-        "Campbell": classical_masses_train["Campbell"] / estim_masses[:train_and_val_size, 4],
+        "Walker":   classical_masses_src["Walker"]   / estim_masses[:src_size, 0],
+        "Wolf":     classical_masses_src["Wolf"]     / estim_masses[:src_size, 1],
+        "Amorisco": classical_masses_src["Amorisco"] / estim_masses[:src_size, 2],
+        "Errani":   classical_masses_src["Errani"]   / estim_masses[:src_size, 3],
+        "Campbell": classical_masses_src["Campbell"] / estim_masses[:src_size, 4],
     }
 
-    graphs_train_val = graphs_all[:train_and_val_size]
-    graphs_test_all  = graphs_all[train_and_val_size:]
-    graphs_test      = [g for g, m in zip(graphs_test_all, mask_test) if m]
-
-    file_indices_tv  = raw["file_indices"][:train_and_val_size]
-    train_graphs, val_graphs, train_mask, val_mask = train_val_split(
-        graphs_train_val, file_indices_tv
-    )
-
-    train_loader, val_loader = make_data_loaders(
-        train_graphs, val_graphs, batch_size=64
+    file_indices_src                                     = raw["file_indices"][:src_size]
+    src_train_graphs, src_val_graphs, train_mask, val_mask = train_val_split(
+        graphs_src, file_indices_src
     )
 
     layer_cfg = GRAPH_LAYER_CONFIGS[args.GraphNN_type]
     embedding = GraphNN(
-        in_channels=2,
-        out_channels=128,
-        hidden_graph_channels=128,
-        num_graph_layers=3,
-        hidden_fc_channels=128,
-        num_fc_layers=2,
-        hlr_std=use_hlr_std,
+        in_channels           = 2,
+        out_channels          = 128,
+        hidden_graph_channels = 128,
+        num_graph_layers      = 3,
+        hidden_fc_channels    = 128,
+        num_fc_layers         = 2,
+        hlr_std               = use_hlr_std,
         **layer_cfg,
     )
-
     flow = build_maf_flow(
-        features=n_labels,
-        context_features=128,
-        hidden_features=128,
-        num_transforms=4,
+        features         = n_labels,
+        context_features = 128,
+        hidden_features  = 128,
+        num_transforms   = 4,
     )
 
-    posterior = FlowPosterior(embedding_net=embedding, flow=flow)
+    if use_dann:
+        domain_cls = DomainClassifier(
+            in_features     = 128,
+            hidden_features = args.dann_domain_hidden,
+            lambda_         = 0.0,   # ramped up from zero during training
+        )
+        posterior: DANNFlowPosterior | FlowPosterior = DANNFlowPosterior(
+            embedding_net     = embedding,
+            flow              = flow,
+            domain_classifier = domain_cls,
+        )
+    else:
+        posterior = FlowPosterior(embedding_net=embedding, flow=flow)
 
     posterior_path = os.path.join(model_folder, "posterior.pkl")
 
     if args.mode == "train":
-        summary = train_posterior(
-            posterior, train_loader, val_loader, device,
-            learning_rate=4e-4,
-            max_epochs=500,
-            stop_after_epochs=10,
-        )
+        if use_dann:
+            src_train_loader, src_val_loader, tgt_loader = make_dann_loaders(
+                src_train_graphs, src_val_graphs, graphs_tgt_all, batch_size=64
+            )
+            summary = train_dann_posterior(
+                posterior,
+                src_train_loader, src_val_loader, tgt_loader,
+                device,
+                learning_rate     = 4e-4,
+                max_epochs        = 500,
+                stop_after_epochs = 10,
+                lambda_max        = args.dann_lambda,
+                gamma             = args.dann_gamma,
+            )
+        else:
+            train_loader, val_loader = make_data_loaders(
+                src_train_graphs, src_val_graphs, batch_size=64
+            )
+            summary = train_posterior(
+                posterior, train_loader, val_loader, device,
+                learning_rate     = 4e-4,
+                max_epochs        = 500,
+                stop_after_epochs = 10,
+            )
+
         plot_training_curves(summary, os.path.join(model_folder, "loss.png"))
         with open(posterior_path, "wb") as f:
             pickle.dump(posterior, f)
@@ -690,38 +902,38 @@ def main() -> None:
         with open(posterior_path, "rb") as f:
             posterior = pickle.load(f)
 
-    n_samples = 1000
-    timeout_sec = 5 * 60  # 5 minutes per galaxy
+    n_samples   = 1000
+    timeout_sec = 5 * 60
 
     samples_train_path = os.path.join(model_folder, "samples_train.npy")
     samples_val_path   = os.path.join(model_folder, "samples_val.npy")
     samples_test_path  = os.path.join(model_folder, "samples_test.npy")
 
     if args.mode in ("train", "sample"):
-        print("Sampling training set …")
+        print("Sampling source training set ...")
         samples_train = sample_with_timeout(
-            posterior, train_graphs, n_samples, device, timeout_sec, n_labels
+            posterior, src_train_graphs, n_samples, device, timeout_sec, n_labels
         )
         np.save(samples_train_path, samples_train)
 
-        print("Sampling validation set …")
+        print("Sampling source validation set ...")
         samples_val = sample_with_timeout(
-            posterior, val_graphs, n_samples, device, timeout_sec, n_labels
+            posterior, src_val_graphs, n_samples, device, timeout_sec, n_labels
         )
         np.save(samples_val_path, samples_val)
     else:
         samples_train = np.load(samples_train_path)
         samples_val   = np.load(samples_val_path)
 
-    print("Sampling test set …")
+    print("Sampling test (target) set ...")
     samples_test = sample_with_timeout(
         posterior, graphs_test, n_samples, device, timeout_sec, n_labels
     )
     np.save(samples_test_path, samples_test)
 
-    truths_train = labels_train_val[train_mask]
-    truths_val   = labels_train_val[val_mask]
-    truths_test  = labels_test_filtered
+    truths_train = labels_src[train_mask]
+    truths_val   = labels_src[val_mask]
+    truths_test  = labels_tgt_filtered
 
     ratio_stats = {
         "Training":   compute_ratio_stats(samples_train, truths_train),
@@ -731,35 +943,47 @@ def main() -> None:
 
     for split, (med, p16, p84) in ratio_stats.items():
         print(f"\n{split.upper()}")
-        print("  median:", med)
+        print("  median:",   med)
         print("  p84-p16:", p84 - p16)
 
+    plot_title = (
+        f"DANN  src={src_key}  tgt={tgt_key}"
+        if use_dann else
+        f"{src_key} -> {tgt_key}"
+    )
     plot_mass_ratios(
         label_mass_radii_frac,
         ratio_stats,
         classical_rel,
-        sim=f"{args.train_set} -> {args.test_set}",
-        nstars=args.N_stars,
-        save_path=os.path.join(model_folder, "TrainingVsValidationVsTest.png"),
+        sim       = plot_title,
+        nstars    = args.N_stars,
+        save_path = os.path.join(model_folder, "TrainingVsValidationVsTest.png"),
     )
 
     plot_data = dict(
-        label_mass_radii_frac=label_mass_radii_frac,
-        ratio_stats={k: {"med": v[0], "p16": v[1], "p84": v[2]} for k, v in ratio_stats.items()},
-        train_set=args.train_set,
-        test_set=args.test_set,
-        Nstars=args.N_stars,
-        actual_n=nstars_arr,
-        seed=seed,
-        N_files_train=len_train,
-        N_files_test=len(test_indices),
-        N_proj_per_gal=args.N_proj_per_gal,
-        hlrs=hlrs_from_graphs.tolist(),
-        stds=stds_from_graphs.tolist(),
-        estim_masses=raw["estimator_masses"].tolist(),
-        classical_masses=classical_masses_train,
-        test_long=test_long,
-        model_folder=model_folder,
+        label_mass_radii_frac = label_mass_radii_frac,
+        ratio_stats = {
+            k: {"med": v[0], "p16": v[1], "p84": v[2]}
+            for k, v in ratio_stats.items()
+        },
+        train_set        = src_key,
+        test_set         = tgt_key,
+        dann             = use_dann,
+        dann_source      = args.dann_source,
+        dann_lambda      = args.dann_lambda if use_dann else None,
+        dann_gamma       = args.dann_gamma  if use_dann else None,
+        Nstars           = args.N_stars,
+        actual_n         = nstars_arr,
+        seed             = seed,
+        N_files_train    = len(src_indices),
+        N_files_test     = len(tgt_indices),
+        N_proj_per_gal   = args.N_proj_per_gal,
+        hlrs             = hlrs_from_graphs.tolist(),
+        stds             = stds_from_graphs.tolist(),
+        estim_masses     = raw["estimator_masses"].tolist(),
+        classical_masses = classical_masses_src,
+        test_long        = test_long,
+        model_folder     = model_folder,
     )
     plot_data_path = os.path.join(model_folder, "plot_data.pkl")
     with open(plot_data_path, "wb") as f:
