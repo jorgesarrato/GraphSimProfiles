@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+from typing import Optional
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -392,6 +393,61 @@ def load_phase_space(
         masks              = np.array(masks),
     )
 
+def compute_standardization_stats(
+    graphs: list,
+    mask_missing: Optional[str],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute input and output standardization statistics from training graphs.
+
+    Parameters
+    ----------
+    graphs : list of Data
+        Source **training** graphs only (val/test excluded to avoid leakage).
+    mask_missing : str | None
+        When ``"mask"`` or ``"BIF"``, label statistics for each dimension are
+        computed only over samples where that dimension is resolved
+        (``mask[:, d] == 1``).  Unmasked dimensions use the full set.
+        When ``None``, all samples contribute to every dimension's statistics.
+
+    Returns
+    -------
+    x_mean, x_std : Tensor, shape ``(n_node_features,)``
+        Per-feature mean and std computed across all nodes in all graphs.
+    y_mean, y_std : Tensor, shape ``(n_labels,)``
+        Per-label mean and std; masked dimensions exclude unresolved samples.
+    """
+    # ── Input statistics: pool all node feature vectors ──────────────────────
+    all_x = torch.cat([g.x for g in graphs], dim=0)   # (total_nodes, n_feats)
+    x_mean = all_x.mean(dim=0)
+    x_std  = all_x.std(dim=0).clamp(min=1e-6)
+
+    # ── Output statistics: respect per-dimension resolution masks ─────────────
+    # graph.y  shape: (1, n_labels)  — the raw (unstandardized) label
+    # graph.mask shape: (1, n_labels) — float 1 = resolved, 0 = unresolved
+    all_y    = torch.cat([g.y    for g in graphs], dim=0)   # (N, n_labels)
+    n_labels = all_y.shape[1]
+
+    if mask_missing in ("mask", "BIF"):
+        all_m = torch.cat([g.mask for g in graphs], dim=0)  # (N, n_labels)
+        y_mean = torch.zeros(n_labels)
+        y_std  = torch.ones(n_labels)
+        for d in range(n_labels):
+            resolved = all_m[:, d].bool()
+            vals = all_y[resolved, d]
+            if vals.numel() > 1:
+                y_mean[d] = vals.mean()
+                y_std[d]  = vals.std().clamp(min=1e-6)
+            else:
+                # Fallback if a dimension is fully masked: use global stats
+                y_mean[d] = all_y[:, d].mean()
+                y_std[d]  = all_y[:, d].std().clamp(min=1e-6)
+    else:
+        y_mean = all_y.mean(dim=0)
+        y_std  = all_y.std(dim=0).clamp(min=1e-6)
+
+    return x_mean, x_std, y_mean, y_std
+
+
 def build_graph_list(
     data: dict,
     graph_creator: GraphCreator,
@@ -503,15 +559,26 @@ def train_posterior(
     learning_rate: float = 4e-4,
     max_epochs: int = 500,
     stop_after_epochs: int = 10,
+    lr_factor: float = 0.5,
+    lr_patience: int = 5,
 ) -> dict:
     """Train FlowPosterior with early stopping on validation log-prob.
+
+    Parameters
+    ----------
+    lr_factor : float
+        Multiplicative factor by which the LR is reduced when validation
+        log-prob stops improving.  Passed to ``ReduceLROnPlateau``.
+    lr_patience : int
+        Number of epochs with no improvement before the LR is reduced.
+        Passed to ``ReduceLROnPlateau``.
 
     Returns dict with training_log_probs and validation_log_probs.
     """
     posterior.to(device)
     optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, "max", factor=0.5, patience=5
+        optimizer, mode="max", factor=lr_factor, patience=lr_patience,
     )
     best_val_lp    = float("-inf")
     epochs_no_impr = 0
@@ -543,10 +610,12 @@ def train_posterior(
         val_lps.append(mean_val)
         scheduler.step(mean_val)
 
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch + 1:4d} | "
             f"train log-prob: {mean_train:.4f} | "
-            f"val log-prob:   {mean_val:.4f}"
+            f"val log-prob:   {mean_val:.4f} | "
+            f"lr: {current_lr:.2e}"
         )
 
         if mean_val > best_val_lp:
@@ -571,13 +640,22 @@ def train_dann_posterior(
     stop_after_epochs: int = 10,
     lambda_max: float = 1.0,
     gamma: float = 10.0,
+    lr_factor: float = 0.5,
+    lr_patience: int = 5,
 ) -> dict:
     """DANN training with early stopping on source-domain validation log-prob.
 
-    1. Ramp lambda via the Ganin sigmoid schedule (0 -> lambda_max).
-    2. For each source batch, draw one target batch,
-    compute task + domain losses, back-propagate
-    3. Validate task log-prob on the source validation split only.
+    The LR scheduler monitors the **task** validation log-prob on the source
+    domain only.  Domain loss is intentionally excluded: as domain confusion
+    improves (loss → log 2 ≈ 0.693), the combined loss would mislead the
+    scheduler into reducing LR prematurely.
+
+    Parameters
+    ----------
+    lr_factor : float
+        Multiplicative LR reduction factor for ``ReduceLROnPlateau``.
+    lr_patience : int
+        Epochs without task-val improvement before LR is reduced.
 
     Returns dict with:
         training_log_probs      – per-epoch source task log-probs
@@ -587,8 +665,9 @@ def train_dann_posterior(
     """
     posterior.to(device)
     optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate)
+    # Monitor task val log-prob only — domain loss is excluded deliberately.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, "max", factor=0.5, patience=5
+        optimizer, mode="max", factor=lr_factor, patience=lr_patience,
     )
     best_val_lp    = float("-inf")
     epochs_no_impr = 0
@@ -648,7 +727,8 @@ def train_dann_posterior(
         print(
             f"Epoch {epoch + 1:4d} | lambda={lam:.3f} | "
             f"task: {mean_task:.4f} | domain: {mean_domain:.4f} | "
-            f"dom-acc: {mean_acc:.3f} | val: {mean_val:.4f}"
+            f"dom-acc: {mean_acc:.3f} | val: {mean_val:.4f} | "
+            f"lr: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
         if mean_val > best_val_lp:
@@ -890,6 +970,22 @@ def main() -> None:
         graphs_src, file_indices_src
     )
 
+    # ── Standardization ───────────────────────────────────────────────────────
+    # Computed from source training graphs only to avoid data leakage.
+    # When mask_missing is active, label statistics per dimension exclude
+    # samples where that dimension is unresolved.
+    x_mean, x_std, y_mean, y_std = compute_standardization_stats(
+        src_train_graphs, args.mask_missing
+    )
+    print(
+        f"Input  standardization — mean: {x_mean.numpy().round(4)}  "
+        f"std: {x_std.numpy().round(4)}"
+    )
+    print(
+        f"Output standardization — mean: {y_mean.numpy().round(4)}  "
+        f"std: {y_std.numpy().round(4)}"
+    )
+
     layer_cfg = GRAPH_LAYER_CONFIGS[args.GraphNN_type]
     embedding = GraphNN(
         in_channels           = 2,
@@ -928,7 +1024,10 @@ def main() -> None:
             mask_missing      = args.mask_missing,
         )
     else:
-        posterior = FlowPosterior(embedding_net=embedding, flow=flow, mask_missing= args.mask_missing)
+        posterior = FlowPosterior(embedding_net=embedding, flow=flow, mask_missing=args.mask_missing)
+
+    # Register standardization buffers (moved with the model via .to(device) and pickle).
+    posterior.set_standardization(x_mean, x_std, y_mean, y_std)
 
     posterior_path = os.path.join(model_folder, "posterior.pkl")
 
@@ -946,6 +1045,8 @@ def main() -> None:
                 stop_after_epochs = 10,
                 lambda_max        = args.dann_lambda,
                 gamma             = args.dann_gamma,
+                lr_factor         = 0.5,
+                lr_patience       = 5,
             )
         else:
             train_loader, val_loader = make_data_loaders(
@@ -956,6 +1057,8 @@ def main() -> None:
                 learning_rate     = 4e-4,
                 max_epochs        = 500,
                 stop_after_epochs = 10,
+                lr_factor         = 0.5,
+                lr_patience       = 5,
             )
 
         plot_training_curves(summary, os.path.join(model_folder, "loss.png"))

@@ -28,7 +28,6 @@ from nflows.transforms import (
     RandomPermutation,
 )
 
-
 @functional_transform("knn_graph_grouped")
 class KNNGraphGrouped(BaseTransform):
     """k-NN graph that restricts edges to within user-defined node groups.
@@ -285,6 +284,8 @@ class FlowPosterior(nn.Module):
         Maps graph batches to context vectors.
     flow : nflows.flows.Flow
         Conditional normalizing flow.
+    mask_missing : str | None
+        ``"mask"`` or ``"BIF"`` handling for unresolved label dimensions.
     """
 
     def __init__(
@@ -297,9 +298,52 @@ class FlowPosterior(nn.Module):
         self.embedding_net = embedding_net
         self.flow = flow
         self.mask_missing = mask_missing
+        self.register_buffer("x_mean", torch.zeros(1))
+        self.register_buffer("x_std",  torch.ones(1))
+        self.register_buffer("y_mean", torch.zeros(1))
+        self.register_buffer("y_std",  torch.ones(1))
+
+    def set_standardization(
+        self,
+        x_mean: Tensor,
+        x_std: Tensor,
+        y_mean: Tensor,
+        y_std: Tensor,
+    ) -> None:
+        """Register input/output standardization statistics as buffers.
+
+        Parameters
+        ----------
+        x_mean : Tensor, shape ``(n_node_features,)``
+        x_std  : Tensor, shape ``(n_node_features,)``
+        y_mean : Tensor, shape ``(n_labels,)``
+        y_std  : Tensor, shape ``(n_labels,)``
+        """
+        self.register_buffer("x_mean", x_mean.float())
+        self.register_buffer("x_std",  x_std.float().clamp(min=1e-6))
+        self.register_buffer("y_mean", y_mean.float())
+        self.register_buffer("y_std",  y_std.float().clamp(min=1e-6))
+
+    def _standardize_x(self, data: Data) -> Data:
+        """Return a shallow copy of *data* with node features standardized."""
+        data = data.clone()
+        data.x = (data.x - self.x_mean) / self.x_std
+        return data
+
+    def _standardize_y(self, labels: Tensor) -> Tensor:
+        return (labels - self.y_mean) / self.y_std
+
+    def _unstandardize_y(self, z: Tensor) -> Tensor:
+        return z * self.y_std + self.y_mean
 
     def log_prob(self, labels: Tensor, data: Data) -> Tensor:
-        """Return log p(labels | data) for a batch."""
+        """Return log p(labels | data) for a batch.
+
+        Log-probs are in the original (unstandardized) label space; the
+        Jacobian ``-sum(log y_std)`` is added automatically.
+        """
+        data   = self._standardize_x(data)
+        labels = self._standardize_y(labels)
         context = self.embedding_net(data)
         
         if self.mask_missing == "mask":
@@ -315,8 +359,10 @@ class FlowPosterior(nn.Module):
                 imputed = self.flow.sample(1, context=context).squeeze(1)
             # Combine known labels with imputed labels
             labels = (labels * data.mask) + (imputed * (1.0 - data.mask))
-            
-        return self.flow.log_prob(labels, context=context)
+
+        log_prob = self.flow.log_prob(labels, context=context)
+        log_prob = log_prob - self.y_std.log().sum()
+        return log_prob
 
     @torch.no_grad()
     def sample(self, num_samples: int, data: Data) -> Tensor:
@@ -324,10 +370,12 @@ class FlowPosterior(nn.Module):
     
         ``data`` must contain exactly one graph. Returns shape ``(num_samples, n_labels)``.
         """
+        data    = self._standardize_x(data)
         context = self.embedding_net(data)
         if self.mask_missing == "mask":
             context = torch.cat([context, data.mask], dim=1)
-        return self.flow.sample(num_samples, context=context)
+        z = self.flow.sample(num_samples, context=context)
+        return self._unstandardize_y(z)
 
 class GradientReversalFunction(Function):
     """Identity in the forward pass; negates and scales gradients in backward.
@@ -410,17 +458,24 @@ class DomainClassifier(nn.Module):
         self.grl.lambda_ = lambda_
 
 
-class DANNFlowPosterior(nn.Module):
-    """Full DANN model: shared GNN encoder + flow task head + domain classifier.
+class DANNFlowPosterior(FlowPosterior):
+    """Extends `FlowPosterior` with a domain-adversarial classifier.
+
+    Inherits ``__init__``, ``set_standardization``, ``log_prob``, ``sample``,
+    and all standardization helpers from `FlowPosterior` unchanged.
+    The only additions are ``domain_classifier`` and `dann_forward`.
 
     Parameters
     ----------
     embedding_net : GraphNN
-        Shared feature extractor.
+        Shared feature extractor (passed to :class:`FlowPosterior`).
     flow : Flow
-        Conditional normalizing flow (task head).
+        Conditional normalizing flow / task head.
     domain_classifier : DomainClassifier
-        Adversarial domain head (contains the GRL).
+        Adversarial domain head (contains the GRL).  Operates on the raw
+        128-dim embedding — never the mask-augmented or label-scaled context.
+    mask_missing : str | None
+        ``"mask"`` or ``"BIF"`` handling for unresolved label dimensions.
     """
 
     def __init__(
@@ -428,34 +483,11 @@ class DANNFlowPosterior(nn.Module):
         embedding_net: GraphNN,
         flow: Flow,
         domain_classifier: DomainClassifier,
-        mask_missing: Optional[str] = None
+        mask_missing: Optional[str] = None,
     ) -> None:
-        super().__init__()
-        self.embedding_net     = embedding_net
-        self.flow              = flow
+        super().__init__(embedding_net, flow, mask_missing)
         self.domain_classifier = domain_classifier
-        self.mask_missing      = mask_missing
 
-    def log_prob(self, labels: Tensor, data: Data) -> Tensor:
-        """Per-sample log p(labels | data). Used during validation."""
-        context = self.embedding_net(data)
-        if self.mask_missing == "mask":
-            labels = labels * data.mask
-            context = torch.cat([context, data.mask], dim=1)
-        elif self.mask_missing == "BIF":
-            with torch.no_grad():
-                imputed = self.flow.sample(1, context=context).squeeze(1)
-            labels = (labels * data.mask) + (imputed * (1.0 - data.mask))
-            
-        return self.flow.log_prob(labels, context=context)
-
-    @torch.no_grad()
-    def sample(self, num_samples: int, data: Data) -> Tensor:
-        """Shape: ``(num_samples, n_labels)``."""
-        context = self.embedding_net(data)
-        if self.mask_missing == "mask":
-            context = torch.cat([context, data.mask], dim=1)
-        return self.flow.sample(num_samples, context=context)
 
     def dann_forward(
         self,
@@ -486,23 +518,32 @@ class DANNFlowPosterior(nn.Module):
         n_src = src_batch.num_graphs
         n_tgt = tgt_batch.num_graphs
 
+        src_batch   = self._standardize_x(src_batch)
+        tgt_batch   = self._standardize_x(tgt_batch)
+        src_labels  = self._standardize_y(src_labels)
+
         src_context = self.embedding_net(src_batch)
         tgt_context = self.embedding_net(tgt_batch)
 
         if self.mask_missing == "mask":
-            src_labels_flow = src_labels * src_batch.mask
+            src_labels_flow  = src_labels * src_batch.mask
             src_context_flow = torch.cat([src_context, src_batch.mask], dim=1)
-            task_loss = -self.flow.log_prob(src_labels_flow, context=src_context_flow).mean()
-            
+            log_probs = self.flow.log_prob(src_labels_flow, context=src_context_flow)
+
         elif self.mask_missing == "BIF":
             with torch.no_grad():
                 imputed = self.flow.sample(1, context=src_context).squeeze(1)
             src_labels_flow = (src_labels * src_batch.mask) + (imputed * (1.0 - src_batch.mask))
-            task_loss = -self.flow.log_prob(src_labels_flow, context=src_context).mean()
-            
-        else:
-            task_loss = -self.flow.log_prob(src_labels, context=src_context).mean()
+            log_probs = self.flow.log_prob(src_labels_flow, context=src_context)
 
+        else:
+            log_probs = self.flow.log_prob(src_labels, context=src_context)
+
+        # Jacobian correction for output standardization (constant, but kept for
+        # consistency so task_loss is a valid NLL in the original label space).
+        log_probs = log_probs - self.y_std.log().sum()
+        task_loss = -log_probs.mean()
+        
         domain_labels = torch.cat([
             torch.zeros(n_src, 1, device=src_context.device),
             torch.ones( n_tgt, 1, device=tgt_context.device),
