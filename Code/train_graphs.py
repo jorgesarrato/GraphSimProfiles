@@ -911,6 +911,28 @@ def train_mmd_posterior(
         "mmd_losses":           mmd_losses,
     }
 
+def apply_resolution_mask(
+    samples: np.ndarray,
+    truths: np.ndarray,
+    resolution_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return copies of samples and truths with unresolved dims set to NaN.
+
+    Parameters
+    ----------
+    samples : ndarray, shape ``(n_samples, N, n_labels)``
+    truths  : ndarray, shape ``(N, n_labels)``
+    resolution_mask : ndarray, shape ``(N, n_labels)``, bool
+        True = resolved (keep), False = unresolved (NaN out).
+    """
+    samples = samples.copy()
+    truths  = truths.copy().astype(float)
+    # samples[:, i, d] = NaN for all unresolved (i, d)
+    unresolved = ~resolution_mask                        # (N, n_labels)
+    samples[:, unresolved] = np.nan
+    truths[unresolved]     = np.nan
+    return samples, truths
+    
 def compute_ratio_stats(
     samples: np.ndarray,
     truths: np.ndarray,
@@ -1239,37 +1261,62 @@ def main() -> None:
     truths_val   = labels_src[val_mask]
     truths_test  = labels_tgt_filtered
 
+    # masks_src shape: (N_src_projections, n_labels), bool
+    masks_src  = raw["masks"][:src_size]
+    masks_train = masks_src[train_mask]   # aligned to truths_train / samples_train
+    masks_val   = masks_src[val_mask]     # aligned to truths_val   / samples_val
+
+    # For the test set: apply the same mask_test filter used for labels_tgt_filtered
+    masks_tgt_all      = raw["masks"][src_size:]
+    masks_test         = masks_tgt_all[mask_test]   # aligned to truths_test / samples_test
+
+
     ratio_stats = {
         "Training":   compute_ratio_stats(samples_train, truths_train),
         "Validation": compute_ratio_stats(samples_val,   truths_val),
         "Testing":    compute_ratio_stats(samples_test,  truths_test),
     }
 
-    for split, (med, p16, p84) in ratio_stats.items():
-        print(f"\n{split.upper()}")
-        print("  median:",   med)
-        print("  p84-p16:", p84 - p16)
+    if args.mask_missing:
+        s_train_m, t_train_m = apply_resolution_mask(samples_train, truths_train, masks_train)
+        s_val_m,   t_val_m   = apply_resolution_mask(samples_val,   truths_val,   masks_val)
+        s_test_m,  t_test_m  = apply_resolution_mask(samples_test,  truths_test,  masks_test)
+        ratio_stats_resolved = {
+            "Training":   compute_ratio_stats(s_train_m, t_train_m),
+            "Validation": compute_ratio_stats(s_val_m,   t_val_m),
+            "Testing":    compute_ratio_stats(s_test_m,  t_test_m),
+        }
+    else:
+        ratio_stats_resolved = ratio_stats
 
-    plot_title = (
-        f"DANN  src={src_key}  tgt={tgt_key}"
-        if use_dann else
-        f"{src_key} -> {tgt_key}"
-    )
+    for label, rs in [("ALL DIMS", ratio_stats), ("RESOLVED ONLY", ratio_stats_resolved)]:
+        print(f"\n── {label} ──")
+        for split, (med, p16, p84) in rs.items():
+            print(f"\n{split.upper()}")
+            print("  median:",   med)
+            print("  p84-p16:", p84 - p16)
+
     plot_mass_ratios(
-        label_mass_radii_frac,
-        ratio_stats,
-        classical_rel,
+        label_mass_radii_frac, ratio_stats, classical_rel,
         sim       = plot_title,
         nstars    = args.N_stars,
         save_path = os.path.join(model_folder, "TrainingVsValidationVsTest.png"),
     )
+    if args.mask_missing:
+        plot_mass_ratios(
+            label_mass_radii_frac, ratio_stats_resolved, classical_rel,
+            sim       = plot_title + "  [resolved only]",
+            nstars    = args.N_stars,
+            save_path = os.path.join(model_folder, "TrainingVsValidationVsTest_resolved.png"),
+        )
+
+    def _ratio_stats_to_dict(rs):
+        return {k: {"med": v[0], "p16": v[1], "p84": v[2]} for k, v in rs.items()}
 
     plot_data = dict(
-        label_mass_radii_frac = label_mass_radii_frac,
-        ratio_stats = {
-            k: {"med": v[0], "p16": v[1], "p84": v[2]}
-            for k, v in ratio_stats.items()
-        },
+        label_mass_radii_frac  = label_mass_radii_frac,
+        ratio_stats            = _ratio_stats_to_dict(ratio_stats),
+        ratio_stats_resolved   = _ratio_stats_to_dict(ratio_stats_resolved),
         train_set        = src_key,
         test_set         = tgt_key,
         dann             = use_dann,
