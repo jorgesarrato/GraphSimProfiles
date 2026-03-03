@@ -1146,6 +1146,7 @@ def main() -> None:
         num_graph_layers      = 3,
         hidden_fc_channels    = 128,
         num_fc_layers         = 2,
+        dropout               = 0.1
         hlr_std               = use_hlr_std,
         **layer_cfg,
     )

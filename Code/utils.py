@@ -10,13 +10,14 @@ from typing import Callable, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch_geometric
 import torch_geometric.transforms as T
 from torch import Tensor
 from torch.autograd import Function
 from torch_geometric.data import Batch, Data
 from torch_geometric.data.datapipes import functional_transform
-from torch_geometric.nn import ChebConv, GATConv, GCNConv
+from torch_geometric.nn import ChebConv, GATConv, GCNConv, global_mean_pool, global_max_pool
 from torch_geometric.transforms import BaseTransform
 from torch_geometric.utils import to_undirected
 
@@ -139,6 +140,8 @@ class GraphNN(nn.Module):
         Number of FC layers.
     hlr_std : bool
         Append pre-computed (hlr, std) scalars after pooling.
+    dropout : float
+        Dropout ratio.
     graph_layer_name : str
         One of ``"ChebConv"``, ``"GATConv"``, ``"GCNConv"``.
     graph_layer_params : dict, optional
@@ -164,6 +167,7 @@ class GraphNN(nn.Module):
         hidden_fc_channels: int = 128,
         num_fc_layers: int = 2,
         hlr_std: bool = True,
+        dropout: float = 0.0,
         graph_layer_name: str = "ChebConv",
         graph_layer_params: Optional[dict] = None,
         activation: Union[str, nn.Module, Callable] = "relu",
@@ -172,10 +176,13 @@ class GraphNN(nn.Module):
         super().__init__()
 
         self.hlr_std = hlr_std
+        self.dropout = dropout
         graph_layer_params = graph_layer_params or {}
         activation_params = activation_params or {}
 
         self.graph_layers = nn.ModuleList()
+        self.graph_norms = nn.ModuleList()
+        
         for i in range(num_graph_layers):
             n_in = in_channels if i == 0 else hidden_graph_channels
             self.graph_layers.append(
@@ -183,13 +190,20 @@ class GraphNN(nn.Module):
                     n_in, hidden_graph_channels, graph_layer_name, graph_layer_params
                 )
             )
+            self.graph_norms.append(nn.BatchNorm1d(hidden_graph_channels))
 
         self.fc_layers = nn.ModuleList()
+        self.fc_norms = nn.ModuleList()
+        
+        pool_dim = hidden_graph_channels * 2 
+        
         for i in range(num_fc_layers):
             # After pooling, optionally concatenate hlr and std (2 extra dims)
-            n_in = (hidden_graph_channels + 2) if (i == 0 and hlr_std) else hidden_fc_channels
+            n_in = (pool_dim + 2) if (i == 0 and hlr_std) else hidden_fc_channels
             n_out = out_channels if i == num_fc_layers - 1 else hidden_fc_channels
             self.fc_layers.append(nn.Linear(n_in, n_out))
+            if i < num_fc_layers - 1:
+                self.fc_norms.append(nn.BatchNorm1d(hidden_fc_channels))
 
         if isinstance(activation, str):
             self.activation = getattr(nn.functional, activation)
@@ -203,18 +217,28 @@ class GraphNN(nn.Module):
         """Return context vectors of shape ``(batch_size, out_channels)``."""
         x = data.x
 
-        for layer in self.graph_layers:
+        for i, layer in enumerate(self.graph_layers):
+            x_in = x
             x = layer(x, data.edge_index)
+            x = self.graph_norms[i](x)
             x = self.activation(x, **self.activation_params)
+            x = F.dropout(x, p=self.dropout, training=self.training) 
+            if i > 0:
+                x = x + x_in 
 
-        x = torch_geometric.nn.global_mean_pool(x, data.batch)
+        x_mean = global_mean_pool(x, data.batch)
+        x_max = global_max_pool(x, data.batch)
+        x = torch.cat([x_mean, x_max], dim=1)
 
         if self.hlr_std:
             x = torch.cat([x, data.hlr, data.std], dim=1)
 
-        for layer in self.fc_layers[:-1]:
+        for i, layer in enumerate(self.fc_layers[:-1]):
             x = layer(x)
+            x = self.fc_norms[i](x)
             x = self.activation(x, **self.activation_params)
+            x = F.dropout(x, p=self.dropout, training=self.training) 
+            
         x = self.fc_layers[-1](x)
 
         return x
