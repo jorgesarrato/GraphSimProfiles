@@ -35,6 +35,7 @@ from tqdm import tqdm
 
 from utils import (
     DANNFlowPosterior,
+    MMDFlowPosterior,
     DomainClassifier,
     FlowPosterior,
     GraphCreator,
@@ -188,6 +189,15 @@ DANN examples
         "--mask_missing", choices=["mask", "BIF"], default=None,
         help="Strategy for masking unresolved radii: 'mask' (context aware) or 'BIF' (Bayesian Imputation)",
     )
+    
+    parser.add_argument(
+        "--da_method", choices=["dann", "mmd"], default="dann",
+        help="Domain adaptation method when --dann_source is set (default: dann)",
+    )
+    parser.add_argument(
+        "--mmd_lambda", type=float, default=1.0,
+        help="MMD loss weight (only used with --da_method mmd, default: 1.0)",
+    )
     return parser.parse_args()
 
 
@@ -327,7 +337,8 @@ def load_phase_space(
 
     Returns dict with keys:
         positions, velocities, labels, file_indices,
-        hlrs, stds, estimator_masses, train_and_val_size
+        hlrs, stds, estimator_masses, train_and_val_size,
+        masks
     """
     masks = []
     all_indices = np.concatenate([file_indices_src, file_indices_tgt])
@@ -417,9 +428,17 @@ def compute_standardization_stats(
         Per-label mean and std; masked dimensions exclude unresolved samples.
     """
     # ── Input statistics: pool all node feature vectors ──────────────────────
-    all_x = torch.cat([g.x for g in graphs], dim=0)   # (total_nodes, n_feats)
+    all_x = torch.cat([g.x for g in graphs], dim=0)
     x_mean = all_x.mean(dim=0)
     x_std  = all_x.std(dim=0).clamp(min=1e-6)
+
+    # ── hlr / std scalars ─────────────────────────────────────────────────────
+    all_hlr = torch.cat([g.hlr for g in graphs], dim=0)  # (N, 1)
+    all_std = torch.cat([g.std for g in graphs], dim=0)  # (N, 1)
+    hlr_mean = all_hlr.mean()
+    hlr_std  = all_hlr.std().clamp(min=1e-6)
+    s_mean   = all_std.mean()
+    s_std    = all_std.std().clamp(min=1e-6)
 
     # ── Output statistics: respect per-dimension resolution masks ─────────────
     # graph.y  shape: (1, n_labels)  — the raw (unstandardized) label
@@ -445,8 +464,7 @@ def compute_standardization_stats(
         y_mean = all_y.mean(dim=0)
         y_std  = all_y.std(dim=0).clamp(min=1e-6)
 
-    return x_mean, x_std, y_mean, y_std
-
+    return x_mean, x_std, y_mean, y_std, hlr_mean, hlr_std, s_mean, s_std
 
 def build_graph_list(
     data: dict,
@@ -508,11 +526,16 @@ def _make_loader(
     batch_size: int,
     shuffle: bool,
     num_workers: int = 1,
+    augment: bool = False,
 ) -> torch.utils.data.DataLoader:
     collater = Collater(graphs)
 
     def collate_fn(batch):
         batch = collater(batch)
+        if augment:
+            flip = torch.randint(0, 2, (batch.num_graphs,), device=batch.x.device) * 2 - 1
+            flip_per_node = flip[batch.batch] 
+            batch.x[:, 1] = batch.x[:, 1] * flip_per_node
         return batch, batch.y
 
     return torch.utils.data.DataLoader(
@@ -526,8 +549,8 @@ def make_data_loaders(
     batch_size: int = 64,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     return (
-        _make_loader(train_graphs, batch_size, shuffle=True),
-        _make_loader(val_graphs,   batch_size, shuffle=False),
+        _make_loader(train_graphs, batch_size, shuffle=True,  augment=True),
+        _make_loader(val_graphs,   batch_size, shuffle=False, augment=False),
     )
 
 def make_dann_loaders(
@@ -546,9 +569,9 @@ def make_dann_loaders(
     can be evaluated after training; labels are never used in the DANN step.
     """
     return (
-        _make_loader(src_train, batch_size, shuffle=True),
-        _make_loader(src_val,   batch_size, shuffle=False),
-        _make_loader(tgt_all,   batch_size, shuffle=True),
+        _make_loader(src_train, batch_size, shuffle=True,  augment=True),
+        _make_loader(src_val,   batch_size, shuffle=False, augment=False),
+        _make_loader(tgt_all,   batch_size, shuffle=True,  augment=True),
     )
 
 def train_posterior(
@@ -558,7 +581,7 @@ def train_posterior(
     device: torch.device,
     learning_rate: float = 4e-4,
     max_epochs: int = 500,
-    stop_after_epochs: int = 10,
+    stop_after_epochs: int = 20,
     lr_factor: float = 0.5,
     lr_patience: int = 5,
 ) -> dict:
@@ -576,7 +599,7 @@ def train_posterior(
     Returns dict with training_log_probs and validation_log_probs.
     """
     posterior.to(device)
-    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=5e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_factor, patience=lr_patience,
     )
@@ -637,7 +660,7 @@ def train_dann_posterior(
     device: torch.device,
     learning_rate: float = 4e-4,
     max_epochs: int = 500,
-    stop_after_epochs: int = 10,
+    stop_after_epochs: int = 20,
     lambda_max: float = 1.0,
     gamma: float = 10.0,
     lr_factor: float = 0.5,
@@ -664,7 +687,7 @@ def train_dann_posterior(
         training_domain_accs    – per-epoch domain classifier accuracy
     """
     posterior.to(device)
-    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=5e-5)
     # Monitor task val log-prob only — domain loss is excluded deliberately.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_factor, patience=lr_patience,
@@ -674,8 +697,14 @@ def train_dann_posterior(
     train_lps, val_lps         = [], []
     domain_losses, domain_accs = [], []
 
+    domain_acc_ema = 1.0          
+    ema_alpha      = 0.1          
+    lam            = 0.0          
+
     for epoch in range(max_epochs):
-        lam = ganin_lambda_schedule(epoch, max_epochs, gamma) * lambda_max
+        if domain_acc_ema > 0.52:
+            lam = ganin_lambda_schedule(epoch, max_epochs, gamma) * lambda_max
+
         posterior.domain_classifier.set_lambda(lam)
 
         posterior.train()
@@ -716,13 +745,17 @@ def train_dann_posterior(
         mean_domain = float(np.mean(epoch_dom))
         mean_acc    = float(np.mean(epoch_acc))
         mean_val    = float(np.mean(epoch_val))
+        
+        median_val  = float(np.median(epoch_val)) # Ignore outliers causing loss jumps
+
+        domain_acc_ema = (1 - ema_alpha) * domain_acc_ema + ema_alpha * mean_acc
 
         # Store -task_loss so sign convention matches standard mode (higher = better)
         train_lps.append(-mean_task)
         val_lps.append(mean_val)
         domain_losses.append(mean_domain)
         domain_accs.append(mean_acc)
-        scheduler.step(mean_val)
+        scheduler.step(median_val)
 
         print(
             f"Epoch {epoch + 1:4d} | lambda={lam:.3f} | "
@@ -731,8 +764,8 @@ def train_dann_posterior(
             f"lr: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        if mean_val > best_val_lp:
-            best_val_lp    = mean_val
+        if median_val > best_val_lp:
+            best_val_lp    = median_val
             epochs_no_impr = 0
         else:
             epochs_no_impr += 1
@@ -748,11 +781,11 @@ def train_dann_posterior(
     }
 
 def plot_training_curves(summary: dict, save_path: str) -> None:
-    """Task log-prob panel; adds domain loss/acc panel for DANN runs."""
     has_dann = "training_domain_losses" in summary
-    ncols    = 2 if has_dann else 1
+    has_mmd  = "mmd_losses" in summary
+    ncols    = 2 if (has_dann or has_mmd) else 1
     fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4))
-    ax1 = axes[0] if has_dann else axes
+    ax1 = axes[0] if ncols == 2 else axes
 
     colors = list(mcolors.TABLEAU_COLORS)
     ax1.plot(summary["training_log_probs"],   ls="-",  label="train", c=colors[0])
@@ -772,14 +805,111 @@ def plot_training_curves(summary: dict, save_path: str) -> None:
         ax2.set_xlabel("Epoch")
         ax2.set_ylabel("Domain BCE loss")
         ax2r.set_ylabel("Domain accuracy")
-        ax2.set_title("Domain adversary")
-        lines  = ax2.get_lines() + ax2r.get_lines()
+        ax2.set_title("Domain adversary (DANN)")
+        lines = ax2.get_lines() + ax2r.get_lines()
         ax2.legend(lines, [l.get_label() for l in lines])
+
+    if has_mmd:
+        ax2 = axes[1]
+        ax2.plot(summary["mmd_losses"], label="MMD loss", c=colors[1])
+        ax2.set_xlim(0)
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("MMD² × λ")
+        ax2.set_title("Domain alignment (MMD)")
+        ax2.legend()
 
     fig.tight_layout()
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
 
+def train_mmd_posterior(
+    posterior: MMDFlowPosterior,
+    src_train_loader: torch.utils.data.DataLoader,
+    src_val_loader: torch.utils.data.DataLoader,
+    tgt_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    learning_rate: float = 4e-4,
+    max_epochs: int = 500,
+    stop_after_epochs: int = 20,
+    lr_factor: float = 0.5,
+    lr_patience: int = 5,
+) -> dict:
+    """MMD training with early stopping on source validation log-prob.
+
+    No lambda schedule — MMD weight is fixed at ``posterior.mmd_lambda``.
+    Returns dict with training_log_probs, validation_log_probs, mmd_losses.
+    """
+    posterior.to(device)
+    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=5e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=lr_factor, patience=lr_patience,
+    )
+    best_val_lp    = float("-inf")
+    epochs_no_impr = 0
+    train_lps, val_lps, mmd_losses = [], [], []
+
+    for epoch in range(max_epochs):
+        posterior.train()
+        tgt_iter = iter(tgt_loader)
+        epoch_task, epoch_mmd = [], []
+
+        for src_batch, src_labels in src_train_loader:
+            try:
+                tgt_batch, _ = next(tgt_iter)
+            except StopIteration:
+                tgt_iter      = iter(tgt_loader)
+                tgt_batch, _  = next(tgt_iter)
+
+            src_batch  = src_batch.to(device)
+            src_labels = src_labels.to(device).float()
+            tgt_batch  = tgt_batch.to(device)
+
+            optimizer.zero_grad()
+            task_loss, mmd_loss = posterior.mmd_forward(src_batch, src_labels, tgt_batch)
+            (task_loss + mmd_loss).backward()
+            optimizer.step()
+
+            epoch_task.append(task_loss.item())
+            epoch_mmd.append(mmd_loss.item())
+
+        posterior.eval()
+        epoch_val = []
+        with torch.no_grad():
+            for batch, labels in src_val_loader:
+                batch  = batch.to(device)
+                labels = labels.to(device).float()
+                epoch_val.append(posterior.log_prob(labels, batch).mean().item())
+
+        mean_task = float(np.mean(epoch_task))
+        mean_mmd  = float(np.mean(epoch_mmd))
+        mean_val  = float(np.mean(epoch_val))
+        median_val = float(np.median(epoch_val))
+
+        train_lps.append(-mean_task)
+        val_lps.append(mean_val)
+        mmd_losses.append(mean_mmd)
+        scheduler.step(median_val)
+
+        print(
+            f"Epoch {epoch + 1:4d} | "
+            f"task: {mean_task:.4f} | mmd: {mean_mmd:.6f} | "
+            f"val: {mean_val:.4f} | lr: {optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+        if mean_val > best_val_lp:
+            best_val_lp    = mean_val
+            epochs_no_impr = 0
+        else:
+            epochs_no_impr += 1
+            if epochs_no_impr >= stop_after_epochs:
+                print(f"Early stopping at epoch {epoch + 1}.")
+                break
+
+    return {
+        "training_log_probs":   train_lps,
+        "validation_log_probs": val_lps,
+        "mmd_losses":           mmd_losses,
+    }
 
 def compute_ratio_stats(
     samples: np.ndarray,
@@ -974,8 +1104,8 @@ def main() -> None:
     # Computed from source training graphs only to avoid data leakage.
     # When mask_missing is active, label statistics per dimension exclude
     # samples where that dimension is unresolved.
-    x_mean, x_std, y_mean, y_std = compute_standardization_stats(
-        src_train_graphs, args.mask_missing
+    x_mean, x_std, y_mean, y_std, hlr_mean, hlr_std, s_mean, s_std = compute_standardization_stats(
+    src_train_graphs, args.mask_missing
     )
     print(
         f"Input  standardization — mean: {x_mean.numpy().round(4)}  "
@@ -1008,45 +1138,56 @@ def main() -> None:
         hidden_features  = 128,
         num_transforms   = 4,
     )
+    
+    use_mmd  = use_dann and args.da_method == "mmd"
+    use_dann_adv = use_dann and args.da_method == "dann"
 
-    if use_dann:
-        # The domain classifier always receives the raw 128-dim embedding, never the
-        # mask-augmented context.
+    if use_dann_adv:
         domain_cls = DomainClassifier(
             in_features     = 128,
             hidden_features = args.dann_domain_hidden,
-            lambda_         = 0.0,   # ramped up from zero during training
+            lambda_         = 0.0,
         )
-        posterior: DANNFlowPosterior | FlowPosterior = DANNFlowPosterior(
+        posterior: DANNFlowPosterior | MMDFlowPosterior | FlowPosterior = DANNFlowPosterior(
             embedding_net     = embedding,
             flow              = flow,
             domain_classifier = domain_cls,
             mask_missing      = args.mask_missing,
         )
+    elif use_mmd:
+        posterior = MMDFlowPosterior(
+            embedding_net  = embedding,
+            flow           = flow,
+            mmd_lambda     = args.mmd_lambda,
+            mask_missing   = args.mask_missing,
+        )
     else:
         posterior = FlowPosterior(embedding_net=embedding, flow=flow, mask_missing=args.mask_missing)
 
     # Register standardization buffers (moved with the model via .to(device) and pickle).
-    posterior.set_standardization(x_mean, x_std, y_mean, y_std)
+    posterior.set_standardization(x_mean, x_std, y_mean, y_std, hlr_mean, hlr_std, s_mean, s_std)
 
     posterior_path = os.path.join(model_folder, "posterior.pkl")
 
     if args.mode == "train":
-        if use_dann:
+        if use_dann_adv:
             src_train_loader, src_val_loader, tgt_loader = make_dann_loaders(
                 src_train_graphs, src_val_graphs, graphs_tgt_all, batch_size=64
             )
             summary = train_dann_posterior(
-                posterior,
-                src_train_loader, src_val_loader, tgt_loader,
-                device,
-                learning_rate     = 4e-4,
-                max_epochs        = 500,
-                stop_after_epochs = 10,
-                lambda_max        = args.dann_lambda,
-                gamma             = args.dann_gamma,
-                lr_factor         = 0.5,
-                lr_patience       = 5,
+                posterior, src_train_loader, src_val_loader, tgt_loader, device,
+                learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
+                lambda_max=args.dann_lambda, gamma=args.dann_gamma,
+                lr_factor=0.5, lr_patience=5,
+            )
+        elif use_mmd:
+            src_train_loader, src_val_loader, tgt_loader = make_dann_loaders(
+                src_train_graphs, src_val_graphs, graphs_tgt_all, batch_size=64
+            )
+            summary = train_mmd_posterior(
+                posterior, src_train_loader, src_val_loader, tgt_loader, device,
+                learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
+                lr_factor=0.5, lr_patience=5,
             )
         else:
             train_loader, val_loader = make_data_loaders(
@@ -1054,11 +1195,8 @@ def main() -> None:
             )
             summary = train_posterior(
                 posterior, train_loader, val_loader, device,
-                learning_rate     = 4e-4,
-                max_epochs        = 500,
-                stop_after_epochs = 10,
-                lr_factor         = 0.5,
-                lr_patience       = 5,
+                learning_rate=4e-4, max_epochs=500, stop_after_epochs=10,
+                lr_factor=0.5, lr_patience=5,
             )
 
         plot_training_curves(summary, os.path.join(model_folder, "loss.png"))

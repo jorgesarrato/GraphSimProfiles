@@ -302,6 +302,10 @@ class FlowPosterior(nn.Module):
         self.register_buffer("x_std",  torch.ones(1))
         self.register_buffer("y_mean", torch.zeros(1))
         self.register_buffer("y_std",  torch.ones(1))
+        self.register_buffer("hlr_mean", torch.zeros(1, 1))
+        self.register_buffer("hlr_std",  torch.ones(1, 1))
+        self.register_buffer("s_mean",   torch.zeros(1, 1))
+        self.register_buffer("s_std",    torch.ones(1, 1))
 
     def set_standardization(
         self,
@@ -309,25 +313,25 @@ class FlowPosterior(nn.Module):
         x_std: Tensor,
         y_mean: Tensor,
         y_std: Tensor,
+        hlr_mean: Tensor,
+        hlr_std: Tensor,
+        s_mean: Tensor,
+        s_std: Tensor,
     ) -> None:
-        """Register input/output standardization statistics as buffers.
-
-        Parameters
-        ----------
-        x_mean : Tensor, shape ``(n_node_features,)``
-        x_std  : Tensor, shape ``(n_node_features,)``
-        y_mean : Tensor, shape ``(n_labels,)``
-        y_std  : Tensor, shape ``(n_labels,)``
-        """
-        self.register_buffer("x_mean", x_mean.float())
-        self.register_buffer("x_std",  x_std.float().clamp(min=1e-6))
-        self.register_buffer("y_mean", y_mean.float())
-        self.register_buffer("y_std",  y_std.float().clamp(min=1e-6))
+        self.register_buffer("x_mean",   x_mean.float())
+        self.register_buffer("x_std",    x_std.float().clamp(min=1e-6))
+        self.register_buffer("y_mean",   y_mean.float())
+        self.register_buffer("y_std",    y_std.float().clamp(min=1e-6))
+        self.register_buffer("hlr_mean", hlr_mean.float().reshape(1, 1))
+        self.register_buffer("hlr_std",  hlr_std.float().clamp(min=1e-6).reshape(1, 1))
+        self.register_buffer("s_mean",   s_mean.float().reshape(1, 1))
+        self.register_buffer("s_std",    s_std.float().clamp(min=1e-6).reshape(1, 1))
 
     def _standardize_x(self, data: Data) -> Data:
-        """Return a shallow copy of *data* with node features standardized."""
         data = data.clone()
-        data.x = (data.x - self.x_mean) / self.x_std
+        data.x   = (data.x   - self.x_mean)   / self.x_std
+        data.hlr  = (data.hlr  - self.hlr_mean) / self.hlr_std
+        data.std  = (data.std  - self.s_mean)   / self.s_std
         return data
 
     def _standardize_y(self, labels: Tensor) -> Tensor:
@@ -543,7 +547,7 @@ class DANNFlowPosterior(FlowPosterior):
         # consistency so task_loss is a valid NLL in the original label space).
         log_probs = log_probs - self.y_std.log().sum()
         task_loss = -log_probs.mean()
-        
+
         domain_labels = torch.cat([
             torch.zeros(n_src, 1, device=src_context.device),
             torch.ones( n_tgt, 1, device=tgt_context.device),
@@ -677,7 +681,7 @@ class TimeoutException(Exception):
 
 
 def sample_with_timeout(
-    posterior: Union[FlowPosterior, DANNFlowPosterior],
+    posterior: FlowPosterior,
     data_list: list,
     n_samples: int,
     device: torch.device,
@@ -736,3 +740,126 @@ def sample_with_timeout(
             signal.alarm(0)
 
     return samples
+    
+def mmd_rbf(
+    x: Tensor,
+    y: Tensor,
+    bandwidths: tuple[float, ...] = (0.5, 1.0, 2.0, 5.0),
+) -> Tensor:
+    """Unbiased MMD² with a mixture of RBF kernels.
+
+    Parameters
+    ----------
+    x : Tensor, shape ``(n, d)``  — source embeddings
+    y : Tensor, shape ``(m, d)``  — target embeddings
+    bandwidths : tuple of float
+        Kernel bandwidths.  Using several values makes the estimator robust
+        to the unknown intrinsic scale of the embedding space.
+
+    Returns
+    -------
+    Tensor scalar — MMD² estimate (differentiable w.r.t. both x and y).
+    """
+    def rbf(a: Tensor, b: Tensor, bw: float) -> Tensor:
+        # ||a_i - b_j||^2, shape (n, m)
+        diff = a.unsqueeze(1) - b.unsqueeze(0)
+        sq   = (diff ** 2).sum(-1)  
+        return torch.exp(-sq / (2.0 * bw ** 2))
+
+    mmd = torch.zeros(1, device=x.device)
+    for bw in bandwidths:
+        kxx = rbf(x, x, bw)
+        kyy = rbf(y, y, bw)
+        kxy = rbf(x, y, bw)
+        n, m = x.shape[0], y.shape[0]
+        # Unbiased: exclude diagonal terms
+        mmd = mmd + (
+            (kxx.sum() - kxx.trace()) / (n * (n - 1))
+            + (kyy.sum() - kyy.trace()) / (m * (m - 1))
+            - 2.0 * kxy.mean()
+        )
+    return mmd / len(bandwidths)
+
+
+class MMDFlowPosterior(FlowPosterior):
+    """Extends ``FlowPosterior`` with MMD-based domain alignment.
+
+    Compared to ``DANNFlowPosterior``:
+    - No adversarial classifier, no GRL, no lambda schedule.
+    - Alignment is achieved by minimising MMD² between source and target
+      embeddings, scaled by a fixed ``mmd_lambda``.
+    - ``log_prob`` and ``sample`` are identical to ``FlowPosterior``
+      (fully inherited — no override needed).
+
+    Parameters
+    ----------
+    embedding_net : GraphNN
+    flow : Flow
+    mmd_lambda : float
+        Weight on the MMD loss relative to the task NLL.
+    mmd_bandwidths : tuple of float
+        RBF kernel bandwidths for the MMD estimator.
+    mask_missing : str | None
+    """
+
+    def __init__(
+        self,
+        embedding_net: GraphNN,
+        flow: Flow,
+        mmd_lambda: float = 1.0,
+        mmd_bandwidths: tuple[float, ...] = (0.5, 1.0, 2.0, 5.0),
+        mask_missing: Optional[str] = None,
+    ) -> None:
+        super().__init__(embedding_net, flow, mask_missing)
+        self.mmd_lambda     = mmd_lambda
+        self.mmd_bandwidths = mmd_bandwidths
+
+    def mmd_forward(
+        self,
+        src_batch: Data,
+        src_labels: Tensor,
+        tgt_batch: Data,
+    ) -> tuple[Tensor, Tensor]:
+        """Single MMD forward pass.
+
+        Parameters
+        ----------
+        src_batch : Data
+            Batched source (labelled) graphs.
+        src_labels : Tensor, shape ``(n_src, n_labels)``
+        tgt_batch : Data
+            Batched target (unlabelled) graphs.
+
+        Returns
+        -------
+        task_loss : Tensor
+            ``-mean log p(y | x)`` on source samples.
+        mmd_loss : Tensor
+            ``mmd_lambda * MMD²(src_embeddings, tgt_embeddings)``.
+        """
+        src_batch  = self._standardize_x(src_batch)
+        tgt_batch  = self._standardize_x(tgt_batch)
+        src_labels = self._standardize_y(src_labels)
+
+        src_context = self.embedding_net(src_batch)
+        tgt_context = self.embedding_net(tgt_batch)
+
+        if self.mask_missing == "mask":
+            src_labels_flow  = src_labels * src_batch.mask
+            src_context_flow = torch.cat([src_context, src_batch.mask], dim=1)
+            log_probs = self.flow.log_prob(src_labels_flow, context=src_context_flow)
+        elif self.mask_missing == "BIF":
+            with torch.no_grad():
+                imputed = self.flow.sample(1, context=src_context).squeeze(1)
+            src_labels_flow = (src_labels * src_batch.mask) + (imputed * (1.0 - src_batch.mask))
+            log_probs = self.flow.log_prob(src_labels_flow, context=src_context)
+        else:
+            log_probs = self.flow.log_prob(src_labels, context=src_context)
+
+        log_probs = log_probs - self.y_std.log().sum()
+        task_loss = -log_probs.mean()
+
+        # MMD operates on the raw 128-dim embedding, same convention as DANN
+        mmd_loss = self.mmd_lambda * mmd_rbf(src_context, tgt_context, self.mmd_bandwidths)
+
+        return task_loss, mmd_loss
