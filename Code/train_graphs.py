@@ -16,10 +16,6 @@ DANN  (activated by --dann_source KEY)
                      compatibility; pass any valid population key)
 """
 
-# TODO: check why mask mode BIF produces NaNs
-# TODO: Turn off scheduler during DA lambda ramp up?
-# TODO: Correctly print log_prob and DA loss contributions separately during DA training
-
 from __future__ import annotations
 
 import argparse
@@ -215,6 +211,13 @@ DANN examples
         help="Steepness of the Ganin lambda schedule for MMD (default: 10.0)",
     )
 
+    parser.add_argument(
+        "--da_warmup_pct", type=float, default=0.9,
+        help=(
+            "Fraction of lambda_max at which LR scheduling and early stopping "
+            "become active in DA mode (default: 0.9).  Set to 0 to disable warmup."
+        ),
+    )
     parser.add_argument(
         "--hidden_dim", type=int, default=128,
         help="Hidden width for graph layers AND FC layers (default: 128)",
@@ -616,11 +619,12 @@ def compute_standardization_stats(
     y_mean, y_std : Tensor, shape ``(n_labels,)``
         Per-label mean and std; masked dimensions exclude unresolved samples.
     """
-
+    # ── Input statistics: pool all node feature vectors ──────────────────────
     all_x = torch.cat([g.x for g in graphs], dim=0)
     x_mean = all_x.mean(dim=0)
     x_std  = all_x.std(dim=0).clamp(min=1e-6)
 
+    # ── hlr / std scalars ─────────────────────────────────────────────────────
     all_hlr = torch.cat([g.hlr for g in graphs], dim=0)  # (N, 1)
     all_std = torch.cat([g.std for g in graphs], dim=0)  # (N, 1)
     hlr_mean = all_hlr.mean()
@@ -628,6 +632,7 @@ def compute_standardization_stats(
     s_mean   = all_std.mean()
     s_std    = all_std.std().clamp(min=1e-6)
 
+    # ── Output statistics: respect per-dimension resolution masks ─────────────
     # graph.y  shape: (1, n_labels)  — the raw (unstandardized) label
     # graph.mask shape: (1, n_labels) — float 1 = resolved, 0 = unresolved
     all_y    = torch.cat([g.y    for g in graphs], dim=0)   # (N, n_labels)
@@ -769,7 +774,7 @@ def _make_loader(
 
     return torch.utils.data.DataLoader(
         graphs, batch_size=batch_size, shuffle=shuffle,
-        pin_memory=True, prefetch_factor=2,
+        pin_memory=True,
         num_workers=num_workers, collate_fn=collate_fn,
     )
 
@@ -899,6 +904,7 @@ def train_dann_posterior(
     gamma: float = 10.0,
     lr_factor: float = 0.5,
     lr_patience: int = 5,
+    da_warmup_pct: float = 0.9,
     mlflow_run=None,
 ) -> dict:
     """DANN training with early stopping on source-domain validation log-prob.
@@ -914,6 +920,10 @@ def train_dann_posterior(
         Multiplicative LR reduction factor for ``ReduceLROnPlateau``.
     lr_patience : int
         Epochs without task-val improvement before LR is reduced.
+    da_warmup_pct : float
+        Fraction of ``lambda_max`` at which LR scheduling and early stopping
+        become active.  Before this threshold, the model is allowed to adapt
+        freely without being penalised for a temporarily degraded task loss.
 
     Returns dict with:
         training_log_probs      – per-epoch source task log-probs
@@ -932,11 +942,30 @@ def train_dann_posterior(
     train_lps, val_lps         = [], []
     domain_losses, domain_accs = [], []
 
-    domain_acc_ema = 1.0          
-    ema_alpha      = 0.1          
-    lam            = 0.0          
+    domain_acc_ema = 1.0
+    ema_alpha      = 0.1
+    lam            = 0.0
+
+    # ── DA warmup: compute the epoch at which lambda reaches da_warmup_pct ────
+    # Invert the Ganin schedule: p* = -log(2/(1+x) - 1) / gamma  where x = pct
+    # then warmup_epoch = round(p* * max_epochs).
+    if da_warmup_pct > 0.0:
+        import math
+        x = da_warmup_pct
+        p_star = -math.log(2.0 / (1.0 + x) - 1.0) / gamma
+        warmup_epoch = min(round(p_star * max_epochs), max_epochs - 1)
+        print(
+            f"[DANN warmup] LR scheduling and early stopping disabled until "
+            f"epoch {warmup_epoch + 1} (lambda ≥ {da_warmup_pct:.0%} × lambda_max = "
+            f"{da_warmup_pct * lambda_max:.3f})."
+        )
+    else:
+        warmup_epoch = 0
+        print("[DANN warmup] Warmup disabled (da_warmup_pct=0).")
 
     for epoch in range(max_epochs):
+        da_active = (epoch >= warmup_epoch)
+
         if domain_acc_ema > 0.52:
             lam = ganin_lambda_schedule(epoch, max_epochs, gamma) * lambda_max
 
@@ -990,11 +1019,14 @@ def train_dann_posterior(
         val_lps.append(mean_val)
         domain_losses.append(mean_domain)
         domain_accs.append(mean_acc)
-        scheduler.step(median_val)
+
+        if da_active:
+            scheduler.step(median_val)
 
         current_lr = optimizer.param_groups[0]["lr"]
+        warmup_marker = "" if da_active else " [warmup]"
         print(
-            f"Epoch {epoch + 1:4d} | lambda={lam:.3f} | "
+            f"Epoch {epoch + 1:4d}{warmup_marker} | lambda={lam:.3f} | "
             f"task: {mean_task:.4f} | domain: {mean_domain:.4f} | "
             f"dom-acc: {mean_acc:.3f} | val: {mean_val:.4f} | "
             f"lr: {current_lr:.2e}"
@@ -1004,14 +1036,19 @@ def train_dann_posterior(
             domain_loss=mean_domain, domain_acc=mean_acc, lam=lam,
         )
 
-        if median_val > best_val_lp:
-            best_val_lp    = median_val
-            epochs_no_impr = 0
+        if da_active:
+            if median_val > best_val_lp:
+                best_val_lp    = median_val
+                epochs_no_impr = 0
+            else:
+                epochs_no_impr += 1
+                if epochs_no_impr >= stop_after_epochs:
+                    print(f"Early stopping at epoch {epoch + 1}.")
+                    break
         else:
-            epochs_no_impr += 1
-            if epochs_no_impr >= stop_after_epochs:
-                print(f"Early stopping at epoch {epoch + 1}.")
-                break
+            # During warmup keep best_val_lp current so the patience counter
+            # starts from zero at the moment DA becomes active.
+            best_val_lp = max(best_val_lp, median_val)
 
     return {
         "training_log_probs":     train_lps,
@@ -1075,11 +1112,21 @@ def train_mmd_posterior(
     gamma: float = 10.0,
     lr_factor: float = 0.5,
     lr_patience: int = 5,
+    da_warmup_pct: float = 0.9,
     mlflow_run=None,
 ) -> dict:
     """MMD training with early stopping on source validation log-prob.
 
-    No lambda schedule — MMD weight is fixed at ``posterior.mmd_lambda``.
+    The MMD weight follows the Ganin schedule from 0 → lambda_max.
+    LR scheduling and early stopping are disabled until lambda reaches
+    ``da_warmup_pct * lambda_max``.
+
+    Parameters
+    ----------
+    da_warmup_pct : float
+        Fraction of ``lambda_max`` at which LR scheduling and early stopping
+        become active (default: 0.9).  Set to 0 to disable warmup.
+
     Returns dict with training_log_probs, validation_log_probs, mmd_losses.
     """
     posterior.to(device)
@@ -1091,9 +1138,25 @@ def train_mmd_posterior(
     epochs_no_impr = 0
     train_lps, val_lps, mmd_losses = [], [], []
 
-    lam       = 0.0
+    lam = 0.0
+
+    # ── DA warmup ─────────────────────────────────────────────────────────────
+    if da_warmup_pct > 0.0:
+        import math
+        x = da_warmup_pct
+        p_star = -math.log(2.0 / (1.0 + x) - 1.0) / gamma
+        warmup_epoch = min(round(p_star * max_epochs), max_epochs - 1)
+        print(
+            f"[MMD warmup] LR scheduling and early stopping disabled until "
+            f"epoch {warmup_epoch + 1} (lambda ≥ {da_warmup_pct:.0%} × lambda_max = "
+            f"{da_warmup_pct * lambda_max:.3f})."
+        )
+    else:
+        warmup_epoch = 0
+        print("[MMD warmup] Warmup disabled (da_warmup_pct=0).")
 
     for epoch in range(max_epochs):
+        da_active = (epoch >= warmup_epoch)
         lam = ganin_lambda_schedule(epoch, max_epochs, gamma) * lambda_max
         posterior.mmd_lambda = lam 
         posterior.train()
@@ -1135,11 +1198,14 @@ def train_mmd_posterior(
         train_lps.append(-mean_task)
         val_lps.append(mean_val)
         mmd_losses.append(mean_mmd)
-        scheduler.step(median_val)
+
+        if da_active:
+            scheduler.step(median_val)
 
         current_lr = optimizer.param_groups[0]["lr"]
+        warmup_marker = "" if da_active else " [warmup]"
         print(
-            f"Epoch {epoch + 1:4d} | lambda={lam:.3f} | "
+            f"Epoch {epoch + 1:4d}{warmup_marker} | lambda={lam:.3f} | "
             f"task: {mean_task:.4f} | mmd: {mean_mmd:.6f} | "
             f"val: {mean_val:.4f} | lr: {current_lr:.2e}"
         )
@@ -1148,14 +1214,17 @@ def train_mmd_posterior(
             mmd_loss=mean_mmd, lam=lam,
         )
 
-        if mean_val > best_val_lp:
-            best_val_lp    = mean_val
-            epochs_no_impr = 0
+        if da_active:
+            if mean_val > best_val_lp:
+                best_val_lp    = mean_val
+                epochs_no_impr = 0
+            else:
+                epochs_no_impr += 1
+                if epochs_no_impr >= stop_after_epochs:
+                    print(f"Early stopping at epoch {epoch + 1}.")
+                    break
         else:
-            epochs_no_impr += 1
-            if epochs_no_impr >= stop_after_epochs:
-                print(f"Early stopping at epoch {epoch + 1}.")
-                break
+            best_val_lp = max(best_val_lp, mean_val)
 
     return {
         "training_log_probs":   train_lps,
@@ -1304,6 +1373,7 @@ def build_data(args, label_file, data_folder, seed):
     )
     src_size = raw["train_and_val_size"]
 
+    # ── Label / HLR / std arrays ─────────────────────────────────────────────
     labels_all = np.array(raw["labels"])
     labels_src = labels_all[:src_size]
     labels_tgt = labels_all[src_size:]
@@ -1312,6 +1382,7 @@ def build_data(args, label_file, data_folder, seed):
     hlrs_tgt   = raw["hlrs"][src_size:]
     stds_tgt   = raw["stds"][src_size:]
 
+    # ── Filter target projections to source distribution ─────────────────────
     mask_test = np.ones(len(labels_tgt), dtype=bool)
     for dim in range(labels_tgt.shape[1]):
         lo, hi = labels_src[:, dim].min(), labels_src[:, dim].max()
@@ -1322,6 +1393,7 @@ def build_data(args, label_file, data_folder, seed):
 
     labels_tgt_filtered = labels_tgt[mask_test]
 
+    # ── Build graphs ──────────────────────────────────────────────────────────
     k_neighbors   = min(args.N_stars, 20)
     graph_creator = GraphCreator(
         graph_type   = "KNNGraph",
@@ -1334,6 +1406,7 @@ def build_data(args, label_file, data_folder, seed):
     graphs_tgt_all = graphs_all[src_size:]
     graphs_test    = [g for g, m in zip(graphs_tgt_all, mask_test) if m]
 
+    # ── Apply 'drop' mode: remove source graphs with any unresolved bin ───────
     if args.mask_missing == "drop":
         graphs_src, hlrs_from_graphs_src, stds_from_graphs_src = filter_fully_resolved(
             graphs_src,
@@ -1352,10 +1425,12 @@ def build_data(args, label_file, data_folder, seed):
         file_indices_src     = raw["file_indices"][:src_size]
         masks_src_arr        = raw["masks"][:src_size]
 
+    # ── Train / val split ─────────────────────────────────────────────────────
     src_train_graphs, src_val_graphs, train_mask, val_mask = train_val_split(
         graphs_src, file_indices_src
     )
 
+    # ── Standardization ───────────────────────────────────────────────────────
     x_mean, x_std, y_mean, y_std, hlr_mean, hlr_std, s_mean, s_std = \
         compute_standardization_stats(src_train_graphs, args.mask_missing)
     print(
@@ -1523,6 +1598,7 @@ def run_training(args, posterior, data, device, model_folder, mlflow_run=None):
             learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
             lambda_max=args.dann_lambda, gamma=args.dann_gamma,
             lr_factor=0.5, lr_patience=15,
+            da_warmup_pct=args.da_warmup_pct,
             mlflow_run=mlflow_run,
         )
     elif use_mmd:
@@ -1535,6 +1611,7 @@ def run_training(args, posterior, data, device, model_folder, mlflow_run=None):
             learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
             lambda_max=args.mmd_lambda, gamma=args.mmd_gamma,
             lr_factor=0.5, lr_patience=15,
+            da_warmup_pct=args.da_warmup_pct,
             mlflow_run=mlflow_run,
         )
     else:
@@ -1617,12 +1694,15 @@ def run_evaluation(args, posterior, data, device, model_folder, seed, nstars_arr
     masks_tgt_all = data["raw"]["masks"][len(labels_src):]
     masks_test    = masks_tgt_all[mask_test]
 
+    # ── Ratio stats (all dims) ────────────────────────────────────────────────
     ratio_stats = {
         "Training":   compute_ratio_stats(samples_train, truths_train),
         "Validation": compute_ratio_stats(samples_val,   truths_val),
         "Testing":    compute_ratio_stats(samples_test,  truths_test),
     }
 
+    # ── Ratio stats (resolved dims only) ─────────────────────────────────────
+    # For 'drop' mode all dims are resolved, so resolved == all dims.
     if args.mask_missing in ("mask", "BIF", "drop"):
         s_train_m, t_train_m = apply_resolution_mask(samples_train, truths_train, masks_train)
         s_val_m,   t_val_m   = apply_resolution_mask(samples_val,   truths_val,   masks_val)
@@ -1691,6 +1771,7 @@ def run_evaluation(args, posterior, data, device, model_folder, seed, nstars_arr
         pickle.dump(plot_data, f)
     print(f"Plot data saved to {plot_data_path}")
 
+    # ── MLflow: log final metrics and artefacts ───────────────────────────────
     mlflow_log_results(ratio_stats, ratio_stats_resolved)
     mlflow_log_artefacts(model_folder, args)
 
@@ -1719,6 +1800,7 @@ def main() -> None:
 
     label_file = load_label_file(data_folder, pca_filter)
 
+    # ── Load data, build graphs, split, standardize ───────────────────────────
     data = build_data(args, label_file, data_folder, seed)
 
     src_key  = data["src_key"]
@@ -1750,6 +1832,7 @@ def main() -> None:
         model_folder,
     )
 
+    # ── Save artefacts needed by optuna_sweep.py / benchmark_dataloader.py ───
     import json as _json
     with open(os.path.join(model_folder, "graphs_train.pkl"), "wb") as _f:
         pickle.dump(data["src_train_graphs"], _f)
@@ -1764,13 +1847,16 @@ def main() -> None:
     with open(os.path.join(model_folder, "std_stats.json"), "w") as _f:
         _json.dump(_std, _f)
 
+    # ── Build model ───────────────────────────────────────────────────────────
     posterior      = build_model(args, data)
     posterior_path = os.path.join(model_folder, "posterior.pkl")
 
+    # ── MLflow run wraps training + evaluation ────────────────────────────────
     with setup_mlflow(args, model_str) as mlflow_run:
         mlflow_log_hparams(args, data)
         mlflow.log_param("model_folder", model_folder)
 
+        # ── Train or load ─────────────────────────────────────────────────────
         if args.mode == "train":
             run_training(args, posterior, data, device, model_folder,
                          mlflow_run=mlflow_run)
@@ -1778,6 +1864,7 @@ def main() -> None:
             with open(posterior_path, "rb") as f:
                 posterior = pickle.load(f)
 
+        # ── Evaluate ──────────────────────────────────────────────────────────
         run_evaluation(
             args, posterior, data, device, model_folder,
             seed=seed, nstars_arr=data["nstars_arr"],
