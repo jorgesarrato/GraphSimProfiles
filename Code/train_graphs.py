@@ -16,6 +16,9 @@ DANN  (activated by --dann_source KEY)
                      compatibility; pass any valid population key)
 """
 
+# TODO: check why mask mode BIF produces NaNs
+# TODO: Correctly print log_prob and DA loss contributions separately during DA training
+
 from __future__ import annotations
 
 import argparse
@@ -251,6 +254,38 @@ DANN examples
         "--num_workers", type=int, default=2,
         help="DataLoader worker processes (default: 2)",
     )
+    # ── Training hyperparameters ──────────────────────────────────────────────
+    parser.add_argument(
+        "--learning_rate", type=float, default=4e-4,
+        help="Initial learning rate for Adam (default: 4e-4)",
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=5e-5,
+        help="L2 weight decay for Adam (default: 5e-5)",
+    )
+    parser.add_argument(
+        "--max_epochs", type=int, default=500,
+        help="Maximum number of training epochs (default: 500)",
+    )
+    parser.add_argument(
+        "--stop_after_epochs", type=int, default=20,
+        help="Early stopping patience in epochs (default: 20)",
+    )
+    parser.add_argument(
+        "--lr_factor", type=float, default=0.5,
+        help="LR reduction factor on plateau (default: 0.5)",
+    )
+    parser.add_argument(
+        "--lr_patience", type=int, default=10,
+        help="Epochs without val improvement before LR is reduced (default: 10)",
+    )
+    parser.add_argument(
+        "--bif_warmup_epochs", type=int, default=50,
+        help=(
+            "Epochs before BIF imputation activates (default: 50). "
+            "During warmup, BIF falls back to mask mode. Only used with --mask_missing BIF."
+        ),
+    )
     parser.add_argument(
         "--mlflow_uri", type=str, default=None,
         help=(
@@ -329,6 +364,13 @@ def mlflow_log_hparams(args, data: dict) -> None:
         use_batch_norm    = args.use_batch_norm,
         dropout           = args.dropout,
         # Optimisation
+        learning_rate     = args.learning_rate,
+        weight_decay      = args.weight_decay,
+        max_epochs        = args.max_epochs,
+        stop_after_epochs = args.stop_after_epochs,
+        lr_factor         = args.lr_factor,
+        lr_patience       = args.lr_patience,
+        bif_warmup_epochs = args.bif_warmup_epochs,
         batch_size        = args.batch_size,
         num_workers       = args.num_workers,
         # Domain adaptation
@@ -817,6 +859,7 @@ def train_posterior(
     val_loader: torch.utils.data.DataLoader,
     device: torch.device,
     learning_rate: float = 4e-4,
+    weight_decay: float = 5e-5,
     max_epochs: int = 500,
     stop_after_epochs: int = 20,
     lr_factor: float = 0.5,
@@ -837,7 +880,7 @@ def train_posterior(
     Returns dict with training_log_probs and validation_log_probs.
     """
     posterior.to(device)
-    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=5e-5)
+    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_factor, patience=lr_patience,
     )
@@ -846,6 +889,7 @@ def train_posterior(
     train_lps, val_lps = [], []
 
     for epoch in range(max_epochs):
+        posterior.current_epoch = epoch
         posterior.train()
         epoch_train = []
         for batch, labels in train_loader:
@@ -898,6 +942,7 @@ def train_dann_posterior(
     tgt_loader: torch.utils.data.DataLoader,
     device: torch.device,
     learning_rate: float = 4e-4,
+    weight_decay: float = 5e-5,
     max_epochs: int = 500,
     stop_after_epochs: int = 20,
     lambda_max: float = 1.0,
@@ -932,7 +977,7 @@ def train_dann_posterior(
         training_domain_accs    – per-epoch domain classifier accuracy
     """
     posterior.to(device)
-    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=5e-5)
+    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=weight_decay)
     # Monitor task val log-prob only — domain loss is excluded deliberately.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_factor, patience=lr_patience,
@@ -964,6 +1009,7 @@ def train_dann_posterior(
         print("[DANN warmup] Warmup disabled (da_warmup_pct=0).")
 
     for epoch in range(max_epochs):
+        posterior.current_epoch = epoch
         da_active = (epoch >= warmup_epoch)
 
         if domain_acc_ema > 0.52:
@@ -1106,6 +1152,7 @@ def train_mmd_posterior(
     tgt_loader: torch.utils.data.DataLoader,
     device: torch.device,
     learning_rate: float = 4e-4,
+    weight_decay: float = 5e-5,
     max_epochs: int = 500,
     stop_after_epochs: int = 20,
     lambda_max: float = 1.0,
@@ -1130,7 +1177,7 @@ def train_mmd_posterior(
     Returns dict with training_log_probs, validation_log_probs, mmd_losses.
     """
     posterior.to(device)
-    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=5e-5)
+    optimizer = torch.optim.Adam(posterior.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_factor, patience=lr_patience,
     )
@@ -1156,6 +1203,7 @@ def train_mmd_posterior(
         print("[MMD warmup] Warmup disabled (da_warmup_pct=0).")
 
     for epoch in range(max_epochs):
+        posterior.current_epoch = epoch
         da_active = (epoch >= warmup_epoch)
         lam = ganin_lambda_schedule(epoch, max_epochs, gamma) * lambda_max
         posterior.mmd_lambda = lam 
@@ -1568,6 +1616,7 @@ def build_model(args, data):
         data["hlr_mean"], data["hlr_std"],
         data["s_mean"], data["s_std"],
     )
+    posterior.bif_warmup_epochs = args.bif_warmup_epochs
     return posterior
 
 
@@ -1595,9 +1644,11 @@ def run_training(args, posterior, data, device, model_folder, mlflow_run=None):
         )
         summary = train_dann_posterior(
             posterior, src_train_loader, src_val_loader, tgt_loader, device,
-            learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay, max_epochs=args.max_epochs,
+            stop_after_epochs=args.stop_after_epochs,
             lambda_max=args.dann_lambda, gamma=args.dann_gamma,
-            lr_factor=0.5, lr_patience=15,
+            lr_factor=args.lr_factor, lr_patience=args.lr_patience,
             da_warmup_pct=args.da_warmup_pct,
             mlflow_run=mlflow_run,
         )
@@ -1608,9 +1659,11 @@ def run_training(args, posterior, data, device, model_folder, mlflow_run=None):
         )
         summary = train_mmd_posterior(
             posterior, src_train_loader, src_val_loader, tgt_loader, device,
-            learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay, max_epochs=args.max_epochs,
+            stop_after_epochs=args.stop_after_epochs,
             lambda_max=args.mmd_lambda, gamma=args.mmd_gamma,
-            lr_factor=0.5, lr_patience=15,
+            lr_factor=args.lr_factor, lr_patience=args.lr_patience,
             da_warmup_pct=args.da_warmup_pct,
             mlflow_run=mlflow_run,
         )
@@ -1621,8 +1674,10 @@ def run_training(args, posterior, data, device, model_folder, mlflow_run=None):
         )
         summary = train_posterior(
             posterior, train_loader, val_loader, device,
-            learning_rate=4e-4, max_epochs=500, stop_after_epochs=10,
-            lr_factor=0.5, lr_patience=15,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay, max_epochs=args.max_epochs,
+            stop_after_epochs=args.stop_after_epochs,
+            lr_factor=args.lr_factor, lr_patience=args.lr_patience,
             mlflow_run=mlflow_run,
         )
 

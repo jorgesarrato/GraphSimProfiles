@@ -344,6 +344,8 @@ class FlowPosterior(nn.Module):
         self.embedding_net = embedding_net
         self.flow = flow
         self.mask_missing = mask_missing
+        self.current_epoch = 0
+        self.bif_warmup_epochs = 50  # epochs before BIF imputation activates
         self.register_buffer("x_mean", torch.zeros(1))
         self.register_buffer("x_std",  torch.ones(1))
         self.register_buffer("y_mean", torch.zeros(1))
@@ -400,15 +402,17 @@ class FlowPosterior(nn.Module):
             labels = labels * data.mask
             context = torch.cat([context, data.mask], dim=1)
             
-        elif self.mask_missing == "BIF": 
-            # TO DO: Probably delay BIF activation until x epochs...
-            # Initially sample imputations from a fixed prior?
-
-            # Bayesian Imputation: Use the flow to guess the missing values
-            with torch.no_grad():
-                imputed = self.flow.sample(1, context=context).squeeze(1)
-            # Combine known labels with imputed labels
-            labels = (labels * data.mask) + (imputed * (1.0 - data.mask))
+        elif self.mask_missing == "BIF":
+            if self.current_epoch >= self.bif_warmup_epochs:
+                # Bayesian Imputation: use the flow to guess the missing values
+                with torch.no_grad():
+                    imputed = self.flow.sample(1, context=context).squeeze(1)
+                    imputed = imputed.clamp(-5.0, 5.0)  # in standardized label space
+                labels = (labels * data.mask) + (imputed * (1.0 - data.mask))
+            else:
+                # Warmup: fall back to mask mode (zero unresolved dims, no imputation)
+                labels = labels * data.mask
+        
 
         log_prob = self.flow.log_prob(labels, context=context)
         log_prob = log_prob - self.y_std.log().sum()
@@ -417,14 +421,21 @@ class FlowPosterior(nn.Module):
     @torch.no_grad()
     def sample(self, num_samples: int, data: Data) -> Tensor:
         """Draw ``num_samples`` samples from p(labels | data).
-    
-        ``data`` must contain exactly one graph. Returns shape ``(num_samples, n_labels)``.
+
+        ``data`` may contain one **or more** graphs (i.e. a PyG batch).
+        Returns shape ``(num_samples, B, n_labels)`` where B = data.num_graphs.
+
+        nflows' ``Flow.sample(n, context)`` with context shape ``(B, d)``
+        returns ``(n * B, n_labels)`` — samples are laid out as
+        [graph_0 × n, graph_1 × n, ...].  We reshape to ``(n, B, n_labels)``.
         """
         data    = self._standardize_x(data)
-        context = self.embedding_net(data)
+        context = self.embedding_net(data)           # (B, d)
         if self.mask_missing == "mask":
             context = torch.cat([context, data.mask], dim=1)
-        z = self.flow.sample(num_samples, context=context)
+        B = context.shape[0]
+        z = self.flow.sample(num_samples, context=context)  # (num_samples * B, n_labels)
+        z = z.reshape(num_samples, B, -1)                   # (num_samples, B, n_labels)
         return self._unstandardize_y(z)
 
 class GradientReversalFunction(Function):
@@ -582,9 +593,13 @@ class DANNFlowPosterior(FlowPosterior):
             log_probs = self.flow.log_prob(src_labels_flow, context=src_context_flow)
 
         elif self.mask_missing == "BIF":
-            with torch.no_grad():
-                imputed = self.flow.sample(1, context=src_context).squeeze(1)
-            src_labels_flow = (src_labels * src_batch.mask) + (imputed * (1.0 - src_batch.mask))
+            if self.current_epoch >= self.bif_warmup_epochs:
+                with torch.no_grad():
+                    imputed = self.flow.sample(1, context=src_context).squeeze(1)
+                    imputed = imputed.clamp(-5.0, 5.0)
+                src_labels_flow = (src_labels * src_batch.mask) + (imputed * (1.0 - src_batch.mask))
+            else:
+                src_labels_flow = src_labels * src_batch.mask
             log_probs = self.flow.log_prob(src_labels_flow, context=src_context)
 
         else:
@@ -734,11 +749,14 @@ def sample_with_timeout(
     device: torch.device,
     timeout_sec: int,
     ndims: int,
+    batch_size: int = 64,
 ) -> np.ndarray:
     """Sample from the posterior for every graph in *data_list*.
 
-    A per-sample SIGALRM timeout is applied so that hanging GPU calls do not
-    block indefinitely.  Timed-out entries are filled with NaN.
+    Graphs are processed in batches so the GNN encoder and flow run on
+    many graphs in parallel, keeping GPU utilisation high.  A single
+    SIGALRM timeout wraps each batch call; timed-out batches are filled
+    with NaN.
 
     Parameters
     ----------
@@ -751,36 +769,47 @@ def sample_with_timeout(
     device : torch.device
         Device to run inference on.
     timeout_sec : int
-        Maximum seconds to wait per data point.
+        Maximum seconds to wait per **batch**.  Scale proportionally to
+        batch_size relative to the old per-graph timeout.
     ndims : int
         Dimensionality of the posterior (number of labels).
+    batch_size : int
+        Number of graphs per forward pass (default: 64).
 
     Returns
     -------
     np.ndarray
         Shape ``(n_samples, len(data_list), ndims)``.
     """
+    from torch_geometric.data import Batch
+
     samples = np.full((n_samples, len(data_list), ndims), np.nan)
 
     def _timeout_handler(signum, frame):
         raise TimeoutException
 
-    for idx, graph in enumerate(data_list):
-        print(f"Sampling {idx + 1}/{len(data_list)}")
+    n_total  = len(data_list)
+    n_batches = (n_total + batch_size - 1) // batch_size
+
+    for b_idx in range(n_batches):
+        lo = b_idx * batch_size
+        hi = min(lo + batch_size, n_total)
+        graphs_batch = data_list[lo:hi]
+        print(f"Sampling batch {b_idx + 1}/{n_batches}  (graphs {lo + 1}–{hi})")
+
         signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(timeout_sec)
         try:
-            graph = graph.to(device)
-            # FlowPosterior.sample expects a batched Data object
-            # Wrap single graph in a batch
-            from torch_geometric.data import Batch
-            batch = Batch.from_data_list([graph])
-            draw = posterior.sample(n_samples, batch)  # (n_samples, ndims)
-            samples[:, idx, :] = draw.detach().cpu().numpy()
-            del graph, batch, draw
+            batch = Batch.from_data_list(
+                [g.to(device) for g in graphs_batch]
+            )
+            # draw: (n_samples, B, ndims)
+            draw = posterior.sample(n_samples, batch)
+            samples[:, lo:hi, :] = draw.detach().cpu().numpy()
+            del batch, draw
         except TimeoutException:
             print(
-                f"  Warning: data point {idx} exceeded timeout "
+                f"  Warning: batch {b_idx} exceeded timeout "
                 f"({timeout_sec // 60} min). Filling with NaN."
             )
         finally:
@@ -897,9 +926,13 @@ class MMDFlowPosterior(FlowPosterior):
             src_context_flow = torch.cat([src_context, src_batch.mask], dim=1)
             log_probs = self.flow.log_prob(src_labels_flow, context=src_context_flow)
         elif self.mask_missing == "BIF":
-            with torch.no_grad():
-                imputed = self.flow.sample(1, context=src_context).squeeze(1)
-            src_labels_flow = (src_labels * src_batch.mask) + (imputed * (1.0 - src_batch.mask))
+            if self.current_epoch >= self.bif_warmup_epochs:
+                with torch.no_grad():
+                    imputed = self.flow.sample(1, context=src_context).squeeze(1)
+                    imputed = imputed.clamp(-5.0, 5.0)
+                src_labels_flow = (src_labels * src_batch.mask) + (imputed * (1.0 - src_batch.mask))
+            else:
+                src_labels_flow = src_labels * src_batch.mask
             log_probs = self.flow.log_prob(src_labels_flow, context=src_context)
         else:
             log_probs = self.flow.log_prob(src_labels, context=src_context)
