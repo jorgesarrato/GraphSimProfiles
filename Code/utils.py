@@ -29,6 +29,21 @@ from nflows.transforms import (
     RandomPermutation,
 )
 
+from contextlib import contextmanager
+
+@contextmanager
+def _frozen_bn(module: nn.Module):
+    """Temporarily set all BatchNorm layers to eval mode (freezes running
+    stats) without affecting the training mode of the rest of the network."""
+    bn_layers = [m for m in module.modules() if isinstance(m, nn.BatchNorm1d)]
+    for m in bn_layers:
+        m.eval()
+    try:
+        yield
+    finally:
+        for m in bn_layers:
+            m.train()
+
 @functional_transform("knn_graph_grouped")
 class KNNGraphGrouped(BaseTransform):
     """k-NN graph that restricts edges to within user-defined node groups.
@@ -142,6 +157,12 @@ class GraphNN(nn.Module):
         Append pre-computed (hlr, std) scalars after pooling.
     dropout : float
         Dropout ratio.
+    use_residuals : bool
+        Add skip connections between graph layers (layer i → layer i+1).
+        The first layer never gets a residual (input dim differs).
+    use_batch_norm : bool
+        Apply BatchNorm1d after each graph and FC hidden layer.
+        When False, Identity is used so the rest of the code is unchanged.
     graph_layer_name : str
         One of ``"ChebConv"``, ``"GATConv"``, ``"GCNConv"``.
     graph_layer_params : dict, optional
@@ -154,8 +175,8 @@ class GraphNN(nn.Module):
 
     GRAPH_LAYERS: dict[str, type] = {
         "ChebConv": ChebConv,
-        "GATConv": GATConv,
-        "GCNConv": GCNConv,
+        "GATConv":  GATConv,
+        "GCNConv":  GCNConv,
     }
 
     def __init__(
@@ -168,6 +189,8 @@ class GraphNN(nn.Module):
         num_fc_layers: int = 2,
         hlr_std: bool = True,
         dropout: float = 0.0,
+        use_residuals: bool = True,
+        use_batch_norm: bool = True,
         graph_layer_name: str = "ChebConv",
         graph_layer_params: Optional[dict] = None,
         activation: Union[str, nn.Module, Callable] = "relu",
@@ -175,14 +198,14 @@ class GraphNN(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.hlr_std = hlr_std
-        self.dropout = dropout
+        self.hlr_std       = hlr_std
+        self.dropout       = dropout
+        self.use_residuals = use_residuals
         graph_layer_params = graph_layer_params or {}
-        activation_params = activation_params or {}
+        activation_params  = activation_params  or {}
 
         self.graph_layers = nn.ModuleList()
-        self.graph_norms = nn.ModuleList()
-        
+        self.graph_norms  = nn.ModuleList()
         for i in range(num_graph_layers):
             n_in = in_channels if i == 0 else hidden_graph_channels
             self.graph_layers.append(
@@ -190,20 +213,23 @@ class GraphNN(nn.Module):
                     n_in, hidden_graph_channels, graph_layer_name, graph_layer_params
                 )
             )
-            self.graph_norms.append(nn.BatchNorm1d(hidden_graph_channels))
+            self.graph_norms.append(
+                nn.BatchNorm1d(hidden_graph_channels) if use_batch_norm
+                else nn.Identity()
+            )
 
+        pool_dim = hidden_graph_channels * 2
         self.fc_layers = nn.ModuleList()
-        self.fc_norms = nn.ModuleList()
-        
-        pool_dim = hidden_graph_channels * 2 
-        
+        self.fc_norms  = nn.ModuleList()
         for i in range(num_fc_layers):
-            # After pooling, optionally concatenate hlr and std (2 extra dims)
-            n_in = (pool_dim + 2) if (i == 0 and hlr_std) else hidden_fc_channels
+            n_in  = (pool_dim + 2) if (i == 0 and hlr_std) else hidden_fc_channels
             n_out = out_channels if i == num_fc_layers - 1 else hidden_fc_channels
             self.fc_layers.append(nn.Linear(n_in, n_out))
             if i < num_fc_layers - 1:
-                self.fc_norms.append(nn.BatchNorm1d(hidden_fc_channels))
+                self.fc_norms.append(
+                    nn.BatchNorm1d(hidden_fc_channels) if use_batch_norm
+                    else nn.Identity()
+                )
 
         if isinstance(activation, str):
             self.activation = getattr(nn.functional, activation)
@@ -214,21 +240,19 @@ class GraphNN(nn.Module):
         self.activation_params = activation_params
 
     def forward(self, data: Data) -> Tensor:
-        """Return context vectors of shape ``(batch_size, out_channels)``."""
         x = data.x
-
         for i, layer in enumerate(self.graph_layers):
             x_in = x
-            x = layer(x, data.edge_index)
-            x = self.graph_norms[i](x)
-            x = self.activation(x, **self.activation_params)
-            x = F.dropout(x, p=self.dropout, training=self.training) 
-            if i > 0:
-                x = x + x_in 
+            x    = layer(x, data.edge_index)
+            x    = self.graph_norms[i](x)
+            x    = self.activation(x, **self.activation_params)
+            x    = F.dropout(x, p=self.dropout, training=self.training)
+            if self.use_residuals and i > 0:
+                x = x + x_in
 
         x_mean = global_mean_pool(x, data.batch)
-        x_max = global_max_pool(x, data.batch)
-        x = torch.cat([x_mean, x_max], dim=1)
+        x_max  = global_max_pool(x, data.batch)
+        x      = torch.cat([x_mean, x_max], dim=1)
 
         if self.hlr_std:
             x = torch.cat([x, data.hlr, data.std], dim=1)
@@ -237,10 +261,8 @@ class GraphNN(nn.Module):
             x = layer(x)
             x = self.fc_norms[i](x)
             x = self.activation(x, **self.activation_params)
-            x = F.dropout(x, p=self.dropout, training=self.training) 
-            
+            x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.fc_layers[-1](x)
-
         return x
 
     def _build_graph_layer(
@@ -551,7 +573,8 @@ class DANNFlowPosterior(FlowPosterior):
         src_labels  = self._standardize_y(src_labels)
 
         src_context = self.embedding_net(src_batch)
-        tgt_context = self.embedding_net(tgt_batch)
+        with _frozen_bn(self.embedding_net):
+            tgt_context = self.embedding_net(tgt_batch)  # gradients flow, BN stats frozen
 
         if self.mask_missing == "mask":
             src_labels_flow  = src_labels * src_batch.mask
@@ -866,7 +889,8 @@ class MMDFlowPosterior(FlowPosterior):
         src_labels = self._standardize_y(src_labels)
 
         src_context = self.embedding_net(src_batch)
-        tgt_context = self.embedding_net(tgt_batch)
+        with _frozen_bn(self.embedding_net):
+            tgt_context = self.embedding_net(tgt_batch)  # gradients flow, BN stats frozen
 
         if self.mask_missing == "mask":
             src_labels_flow  = src_labels * src_batch.mask

@@ -16,6 +16,10 @@ DANN  (activated by --dann_source KEY)
                      compatibility; pass any valid population key)
 """
 
+# TODO: check why mask mode BIF produces NaNs
+# TODO: Turn off scheduler during DA lambda ramp up?
+# TODO: Correctly print log_prob and DA loss contributions separately during DA training
+
 from __future__ import annotations
 
 import argparse
@@ -32,6 +36,8 @@ from accelerate import Accelerator
 from scipy.interpolate import interp1d
 from torch_geometric.loader.dataloader import Collater
 from tqdm import tqdm
+
+import mlflow
 
 from utils import (
     DANNFlowPosterior,
@@ -186,8 +192,13 @@ DANN examples
     )
     
     parser.add_argument(
-        "--mask_missing", choices=["mask", "BIF"], default=None,
-        help="Strategy for masking unresolved radii: 'mask' (context aware) or 'BIF' (Bayesian Imputation)",
+        "--mask_missing", choices=["mask", "BIF", "drop"], default=None,
+        help=(
+            "Strategy for handling unresolved radii: "
+            "'mask' (context-aware masking), "
+            "'BIF' (Bayesian imputation), "
+            "'drop' (discard any sample with at least one unresolved bin)."
+        ),
     )
     
     parser.add_argument(
@@ -198,7 +209,185 @@ DANN examples
         "--mmd_lambda", type=float, default=1.0,
         help="MMD loss weight (only used with --da_method mmd, default: 1.0)",
     )
+
+    parser.add_argument(
+        "--mmd_gamma", type=float, default=10.0,
+        help="Steepness of the Ganin lambda schedule for MMD (default: 10.0)",
+    )
+
+    parser.add_argument(
+        "--hidden_dim", type=int, default=128,
+        help="Hidden width for graph layers AND FC layers (default: 128)",
+    )
+    parser.add_argument(
+        "--num_graph_layers", type=int, default=3,
+        help="Number of graph convolution layers (default: 3)",
+    )
+    parser.add_argument(
+        "--num_fc_layers", type=int, default=2,
+        help="Number of FC layers after pooling (default: 2)",
+    )
+    parser.add_argument(
+        "--use_residuals", type=int, choices=[0, 1], default=1,
+        help="Skip connections between graph layers (default: 1)",
+    )
+    parser.add_argument(
+        "--use_batch_norm", type=int, choices=[0, 1], default=1,
+        help="BatchNorm1d after each graph/FC layer (default: 1)",
+    )
+    parser.add_argument(
+        "--dropout", type=float, default=0.1,
+        help="Dropout probability after each graph/FC layer (default: 0.1)",
+    )
+
+    parser.add_argument(
+        "--batch_size", type=int, default=128,
+        help="Training batch size (default: 128)",
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=2,
+        help="DataLoader worker processes (default: 2)",
+    )
+    parser.add_argument(
+        "--mlflow_uri", type=str, default=None,
+        help=(
+            "MLflow tracking URI. If omitted, MLflow tracking is disabled. "
+            "Examples: 'file:///path/to/mlruns'  'http://host:5000'"
+        ),
+    )
+    parser.add_argument(
+        "--mlflow_experiment", type=str, default="graph_flow_posterior",
+        help="MLflow experiment name (default: 'graph_flow_posterior')",
+    )
     return parser.parse_args()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MLflow helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _NullRun:
+    """Drop-in replacement for an mlflow ActiveRun when tracking is disabled.
+
+    Every attribute access and method call returns self or a no-op so that
+    all ``mlflow.*`` call sites can be written unconditionally.
+    """
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
+    def __getattr__(self, _): return lambda *a, **kw: None
+
+
+def setup_mlflow(args, model_str: str):
+    """Configure MLflow and return an active run context manager.
+
+    If ``--mlflow_uri`` is not provided, returns a ``_NullRun`` that silently
+    ignores all logging calls so the rest of the code is unchanged.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+    model_str : str
+        Used as the MLflow run name for easy identification in the UI.
+
+    Returns
+    -------
+    run : mlflow.ActiveRun | _NullRun
+        Use as ``with setup_mlflow(...) as run:``.
+    """
+    if args.mlflow_uri is None:
+        return _NullRun()
+
+    mlflow.set_tracking_uri(args.mlflow_uri)
+    mlflow.set_experiment(args.mlflow_experiment)
+    return mlflow.start_run(run_name=model_str)
+
+
+def mlflow_log_hparams(args, data: dict) -> None:
+    """Log all hyperparameters as MLflow params (strings/scalars only)."""
+    use_dann = args.dann_source is not None
+    params = dict(
+        # Data / sampling
+        train_set      = data["src_key"],
+        test_set       = data["tgt_key"],
+        N_stars        = args.N_stars,
+        N_proj_per_gal = args.N_proj_per_gal,
+        N_src_galaxies = len(data["src_indices"]),
+        N_tgt_galaxies = len(data["tgt_indices"]),
+        mask_missing   = str(args.mask_missing),
+        PCAfilter      = args.PCAfilter,
+        hlr_std        = args.hlr_std,
+        # Architecture
+        GraphNN_type      = args.GraphNN_type,
+        hidden_dim        = args.hidden_dim,
+        num_graph_layers  = args.num_graph_layers,
+        num_fc_layers     = args.num_fc_layers,
+        use_residuals     = args.use_residuals,
+        use_batch_norm    = args.use_batch_norm,
+        dropout           = args.dropout,
+        # Optimisation
+        batch_size        = args.batch_size,
+        num_workers       = args.num_workers,
+        # Domain adaptation
+        da_enabled        = use_dann,
+        da_method         = args.da_method if use_dann else "none",
+        dann_source       = str(args.dann_source),
+        dann_lambda       = args.dann_lambda,
+        dann_gamma        = args.dann_gamma,
+        mmd_lambda        = args.mmd_lambda,
+        mmd_gamma         = args.mmd_gamma,
+    )
+    mlflow.log_params(params)
+
+
+def mlflow_log_epoch(
+    epoch: int,
+    *,
+    train_lp: float,
+    val_lp: float,
+    lr: float,
+    domain_loss: float | None = None,
+    domain_acc:  float | None = None,
+    mmd_loss:    float | None = None,
+    lam:         float | None = None,
+) -> None:
+    """Log per-epoch scalars to the active MLflow run."""
+    metrics = {
+        "train_log_prob": train_lp,
+        "val_log_prob":   val_lp,
+        "learning_rate":  lr,
+    }
+    if domain_loss is not None: metrics["domain_loss"] = domain_loss
+    if domain_acc  is not None: metrics["domain_acc"]  = domain_acc
+    if mmd_loss    is not None: metrics["mmd_loss"]    = mmd_loss
+    if lam         is not None: metrics["lambda"]      = lam
+    mlflow.log_metrics(metrics, step=epoch)
+
+
+def mlflow_log_results(ratio_stats: dict, ratio_stats_resolved: dict) -> None:
+    """Log final mass-ratio summary statistics as MLflow metrics."""
+    for tag, rs in [("all", ratio_stats), ("resolved", ratio_stats_resolved)]:
+        for split, (med, p16, p84) in rs.items():
+            prefix = f"{tag}_{split.lower()}"
+            # Log per-bin median and scatter as flat scalar arrays
+            for i, (m, lo, hi) in enumerate(zip(med, p16, p84)):
+                mlflow.log_metrics({
+                    f"{prefix}_median_bin{i}": float(m),
+                    f"{prefix}_scatter_bin{i}": float(hi - lo),
+                }, step=i)
+            # Summary scalars: mean over bins
+            mlflow.log_metrics({
+                f"{prefix}_median_mean":  float(np.mean(np.abs(med - 1))),
+                f"{prefix}_scatter_mean": float(np.mean(p84 - p16)),
+            })
+
+
+def mlflow_log_artefacts(model_folder: str, args) -> None:
+    """Log files from model_folder as MLflow artefacts."""
+    for fname in ("posterior.pkl", "plot_data.pkl"):
+        path = os.path.join(model_folder, fname)
+        if os.path.exists(path):
+            mlflow.log_artifact(path)
 
 
 def load_label_file(data_folder: str, pca_filter: bool) -> pd.DataFrame:
@@ -427,12 +616,11 @@ def compute_standardization_stats(
     y_mean, y_std : Tensor, shape ``(n_labels,)``
         Per-label mean and std; masked dimensions exclude unresolved samples.
     """
-    # ── Input statistics: pool all node feature vectors ──────────────────────
+
     all_x = torch.cat([g.x for g in graphs], dim=0)
     x_mean = all_x.mean(dim=0)
     x_std  = all_x.std(dim=0).clamp(min=1e-6)
 
-    # ── hlr / std scalars ─────────────────────────────────────────────────────
     all_hlr = torch.cat([g.hlr for g in graphs], dim=0)  # (N, 1)
     all_std = torch.cat([g.std for g in graphs], dim=0)  # (N, 1)
     hlr_mean = all_hlr.mean()
@@ -440,13 +628,13 @@ def compute_standardization_stats(
     s_mean   = all_std.mean()
     s_std    = all_std.std().clamp(min=1e-6)
 
-    # ── Output statistics: respect per-dimension resolution masks ─────────────
     # graph.y  shape: (1, n_labels)  — the raw (unstandardized) label
     # graph.mask shape: (1, n_labels) — float 1 = resolved, 0 = unresolved
     all_y    = torch.cat([g.y    for g in graphs], dim=0)   # (N, n_labels)
     n_labels = all_y.shape[1]
 
     if mask_missing in ("mask", "BIF"):
+        # Per-dimension statistics using only resolved samples for each dim.
         all_m = torch.cat([g.mask for g in graphs], dim=0)  # (N, n_labels)
         y_mean = torch.zeros(n_labels)
         y_std  = torch.ones(n_labels)
@@ -461,6 +649,8 @@ def compute_standardization_stats(
                 y_mean[d] = all_y[:, d].mean()
                 y_std[d]  = all_y[:, d].std().clamp(min=1e-6)
     else:
+        # "drop" mode: every sample is fully resolved, so global stats are correct.
+        # None mode: no masking at all.
         y_mean = all_y.mean(dim=0)
         y_std  = all_y.std(dim=0).clamp(min=1e-6)
 
@@ -491,6 +681,44 @@ def build_graph_list(
         graphs.append(graph)
 
     return graphs, np.array(hlrs), np.array(stds)
+
+def filter_fully_resolved(
+    graphs: list,
+    hlrs: np.ndarray,
+    stds: np.ndarray,
+) -> tuple[list, np.ndarray, np.ndarray]:
+    """Discard graphs that have any unresolved label dimension.
+
+    A graph is kept only when every element of its ``mask`` is 1, i.e.
+    ``mask.min() == 1``.  This corresponds to ``--mask_missing drop``.
+
+    Parameters
+    ----------
+    graphs : list of Data
+        Graph list as returned by :func:`build_graph_list`.
+    hlrs : np.ndarray, shape ``(N,)``
+        Half-light radii aligned with ``graphs``.
+    stds : np.ndarray, shape ``(N,)``
+        Velocity dispersions aligned with ``graphs``.
+
+    Returns
+    -------
+    graphs_out, hlrs_out, stds_out
+        Filtered copies — all three arrays are aligned to the same kept indices.
+    """
+    keep = [g.mask.min().item() == 1.0 for g in graphs]
+    mask_arr    = np.array(keep)
+    graphs_out  = [g for g, k in zip(graphs, keep) if k]
+    hlrs_out    = hlrs[mask_arr]
+    stds_out    = stds[mask_arr]
+    n_before    = len(graphs)
+    n_after     = len(graphs_out)
+    print(
+        f"filter_fully_resolved: kept {n_after} / {n_before} graphs "
+        f"({100 * n_after / max(n_before, 1):.1f}%)"
+    )
+    return graphs_out, hlrs_out, stds_out
+
 
 def compute_classical_estimators(
     stds: np.ndarray,
@@ -525,7 +753,7 @@ def _make_loader(
     graphs: list,
     batch_size: int,
     shuffle: bool,
-    num_workers: int = 1,
+    num_workers: int = 2,
     augment: bool = False,
 ) -> torch.utils.data.DataLoader:
     collater = Collater(graphs)
@@ -533,6 +761,7 @@ def _make_loader(
     def collate_fn(batch):
         batch = collater(batch)
         if augment:
+            batch = batch.clone()
             flip = torch.randint(0, 2, (batch.num_graphs,), device=batch.x.device) * 2 - 1
             flip_per_node = flip[batch.batch] 
             batch.x[:, 1] = batch.x[:, 1] * flip_per_node
@@ -540,6 +769,7 @@ def _make_loader(
 
     return torch.utils.data.DataLoader(
         graphs, batch_size=batch_size, shuffle=shuffle,
+        pin_memory=True, prefetch_factor=2,
         num_workers=num_workers, collate_fn=collate_fn,
     )
 
@@ -547,10 +777,11 @@ def make_data_loaders(
     train_graphs: list,
     val_graphs: list,
     batch_size: int = 64,
+    num_workers: int = 2,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     return (
-        _make_loader(train_graphs, batch_size, shuffle=True,  augment=True),
-        _make_loader(val_graphs,   batch_size, shuffle=False, augment=False),
+        _make_loader(train_graphs, batch_size, shuffle=True,  num_workers=num_workers, augment=True),
+        _make_loader(val_graphs,   batch_size, shuffle=False, num_workers=num_workers, augment=False),
     )
 
 def make_dann_loaders(
@@ -558,6 +789,7 @@ def make_dann_loaders(
     src_val: list,
     tgt_all: list,
     batch_size: int = 64,
+    num_workers: int = 2,
 ) -> tuple[
     torch.utils.data.DataLoader,
     torch.utils.data.DataLoader,
@@ -569,9 +801,9 @@ def make_dann_loaders(
     can be evaluated after training; labels are never used in the DANN step.
     """
     return (
-        _make_loader(src_train, batch_size, shuffle=True,  augment=True),
-        _make_loader(src_val,   batch_size, shuffle=False, augment=False),
-        _make_loader(tgt_all,   batch_size, shuffle=True,  augment=True),
+        _make_loader(src_train, batch_size, shuffle=True,  num_workers=num_workers, augment=True),
+        _make_loader(src_val,   batch_size, shuffle=False, num_workers=num_workers, augment=False),
+        _make_loader(tgt_all,   batch_size, shuffle=True,  num_workers=num_workers, augment=True),
     )
 
 def train_posterior(
@@ -584,6 +816,7 @@ def train_posterior(
     stop_after_epochs: int = 20,
     lr_factor: float = 0.5,
     lr_patience: int = 5,
+    mlflow_run=None,
 ) -> dict:
     """Train FlowPosterior with early stopping on validation log-prob.
 
@@ -640,6 +873,7 @@ def train_posterior(
             f"val log-prob:   {mean_val:.4f} | "
             f"lr: {current_lr:.2e}"
         )
+        mlflow_log_epoch(epoch, train_lp=mean_train, val_lp=mean_val, lr=current_lr)
 
         if mean_val > best_val_lp:
             best_val_lp    = mean_val
@@ -665,6 +899,7 @@ def train_dann_posterior(
     gamma: float = 10.0,
     lr_factor: float = 0.5,
     lr_patience: int = 5,
+    mlflow_run=None,
 ) -> dict:
     """DANN training with early stopping on source-domain validation log-prob.
 
@@ -757,11 +992,16 @@ def train_dann_posterior(
         domain_accs.append(mean_acc)
         scheduler.step(median_val)
 
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch + 1:4d} | lambda={lam:.3f} | "
             f"task: {mean_task:.4f} | domain: {mean_domain:.4f} | "
             f"dom-acc: {mean_acc:.3f} | val: {mean_val:.4f} | "
-            f"lr: {optimizer.param_groups[0]['lr']:.2e}"
+            f"lr: {current_lr:.2e}"
+        )
+        mlflow_log_epoch(
+            epoch, train_lp=-mean_task, val_lp=mean_val, lr=current_lr,
+            domain_loss=mean_domain, domain_acc=mean_acc, lam=lam,
         )
 
         if median_val > best_val_lp:
@@ -831,8 +1071,11 @@ def train_mmd_posterior(
     learning_rate: float = 4e-4,
     max_epochs: int = 500,
     stop_after_epochs: int = 20,
+    lambda_max: float = 1.0,
+    gamma: float = 10.0,
     lr_factor: float = 0.5,
     lr_patience: int = 5,
+    mlflow_run=None,
 ) -> dict:
     """MMD training with early stopping on source validation log-prob.
 
@@ -848,7 +1091,11 @@ def train_mmd_posterior(
     epochs_no_impr = 0
     train_lps, val_lps, mmd_losses = [], [], []
 
+    lam       = 0.0
+
     for epoch in range(max_epochs):
+        lam = ganin_lambda_schedule(epoch, max_epochs, gamma) * lambda_max
+        posterior.mmd_lambda = lam 
         posterior.train()
         tgt_iter = iter(tgt_loader)
         epoch_task, epoch_mmd = [], []
@@ -890,10 +1137,15 @@ def train_mmd_posterior(
         mmd_losses.append(mean_mmd)
         scheduler.step(median_val)
 
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
-            f"Epoch {epoch + 1:4d} | "
+            f"Epoch {epoch + 1:4d} | lambda={lam:.3f} | "
             f"task: {mean_task:.4f} | mmd: {mean_mmd:.6f} | "
-            f"val: {mean_val:.4f} | lr: {optimizer.param_groups[0]['lr']:.2e}"
+            f"val: {mean_val:.4f} | lr: {current_lr:.2e}"
+        )
+        mlflow_log_epoch(
+            epoch, train_lp=-mean_task, val_lp=mean_val, lr=current_lr,
+            mmd_loss=mean_mmd, lam=lam,
         )
 
         if mean_val > best_val_lp:
@@ -1006,38 +1258,28 @@ def plot_label_distributions(
         fig.savefig(os.path.join(save_dir, f"feature_{i}_distribution.png"), bbox_inches="tight")
         plt.close(fig)
 
-def main() -> None:
-    args        = parse_args()
-    use_dann    = args.dann_source is not None
-    test_long   = bool(args.test_long)
-    pca_filter  = bool(args.PCAfilter)
-    use_hlr_std = bool(args.hlr_std)
+# ─────────────────────────────────────────────────────────────────────────────
+# build_data  — load raw phase-space, build graphs, split, standardize
+# ─────────────────────────────────────────────────────────────────────────────
 
-    accelerator = Accelerator()
-    device      = accelerator.device
+def build_data(args, label_file, data_folder, seed):
+    """Load raw data, build graphs, apply mask_missing='drop' if requested,
+    split into train/val, compute standardization statistics.
 
-    seed = 22133
-    np.random.seed(seed)
-
-    pca_suffix  = "PCAfilt" if pca_filter else "PCAnofilt"
-    data_folder = (
-        f"/net/debut/project/jsarrato/Paper-GraphSimProfiles/work/"
-        f"arrs_NIHAO_and_AURIGA_{pca_suffix}_1000/"
-    )
-    main_work_dir = "/net/deimos/scratch/jsarrato/Wolf_for_FIRE/work/"
-
-    label_file            = load_label_file(data_folder, pca_filter)
-    label_mass_radii_frac = np.arange(0.6, 2.6, 0.2)
-    mass_estim_radii_frac = np.array([1.0, 4/3, 1.67, 1.77, 1.8])
-    n_labels              = len(label_mass_radii_frac)
+    Returns a dict with all data artefacts needed by build_model() and
+    run_evaluation().
+    """
+    use_dann  = args.dann_source is not None
+    test_long = bool(args.test_long)
 
     test_limit = None if test_long else 100
-
-    src_key = args.dann_source if use_dann else args.train_set
-    tgt_key = args.test_set
+    src_key    = args.dann_source if use_dann else args.train_set
+    tgt_key    = args.test_set
 
     if src_key == tgt_key:
-        src_indices, tgt_indices = get_split_indices(label_file, src_key, limit=test_limit, seed=seed)
+        src_indices, tgt_indices = get_split_indices(
+            label_file, src_key, limit=test_limit, seed=seed
+        )
     else:
         src_indices = resolve_indices(label_file, src_key)
         tgt_indices = resolve_indices(label_file, tgt_key, limit=test_limit)
@@ -1051,35 +1293,25 @@ def main() -> None:
     n_total    = (len(src_indices) + len(tgt_indices)) * args.N_proj_per_gal
     nstars_arr = np.random.poisson(args.N_stars, size=n_total)
 
-    raw        = load_phase_space(
+    label_mass_radii_frac = np.arange(0.6, 2.6, 0.2)
+    mass_estim_radii_frac = np.array([1.0, 4/3, 1.67, 1.77, 1.8])
+
+    raw      = load_phase_space(
         data_folder, src_indices, tgt_indices,
         args.N_proj_per_gal, nstars_arr,
         label_mass_radii_frac, mass_estim_radii_frac,
-        label_file
+        label_file,
     )
-    src_size = raw["train_and_val_size"]   # projection-level boundary
-
-    dann_tag  = f"_DANN-src{src_key}" if use_dann else ""
-    mask_tag = f"_mask-{args.mask_missing}" if args.mask_missing else ""
-    model_str = (
-        f"{args.GraphNN_type}"
-        f"_src{src_key}_tgt{tgt_key}{dann_tag}{mask_tag}"
-        f"_poisson{args.N_stars}_Nfiles{len(src_indices)}"
-        f"_Nproj{args.N_proj_per_gal}_hlrstd{args.hlr_std}"
-    )
-    model_folder = os.path.join(main_work_dir, "Graph+Flow_Mocks_NH/new/", model_str)
-    os.makedirs(model_folder, exist_ok=True)
+    src_size = raw["train_and_val_size"]
 
     labels_all = np.array(raw["labels"])
     labels_src = labels_all[:src_size]
     labels_tgt = labels_all[src_size:]
+    hlrs_src   = raw["hlrs"][:src_size]
+    stds_src   = raw["stds"][:src_size]
+    hlrs_tgt   = raw["hlrs"][src_size:]
+    stds_tgt   = raw["stds"][src_size:]
 
-    hlrs_src = raw["hlrs"][:src_size]
-    stds_src = raw["stds"][:src_size]
-    hlrs_tgt = raw["hlrs"][src_size:]
-    stds_tgt = raw["stds"][src_size:]
-
-    # Filter target projections to the source distribution
     mask_test = np.ones(len(labels_tgt), dtype=bool)
     for dim in range(labels_tgt.shape[1]):
         lo, hi = labels_src[:, dim].min(), labels_src[:, dim].max()
@@ -1089,46 +1321,43 @@ def main() -> None:
     print(f"Test projections after filtering: {mask_test.sum()} / {len(mask_test)}")
 
     labels_tgt_filtered = labels_tgt[mask_test]
-    plot_label_distributions(labels_src, labels_tgt, labels_tgt_filtered, model_folder)
-
 
     k_neighbors   = min(args.N_stars, 20)
     graph_creator = GraphCreator(
-        graph_type    = "KNNGraph",
-        graph_config  = {"k": k_neighbors, "force_undirected": True, "loop": True},
-        use_log_radius= True,
+        graph_type   = "KNNGraph",
+        graph_config = {"k": k_neighbors, "force_undirected": True, "loop": True},
+        use_log_radius = True,
     )
-
     graphs_all, hlrs_from_graphs, stds_from_graphs = build_graph_list(raw, graph_creator)
 
     graphs_src     = graphs_all[:src_size]
     graphs_tgt_all = graphs_all[src_size:]
     graphs_test    = [g for g, m in zip(graphs_tgt_all, mask_test) if m]
 
-    estim_masses         = raw["estimator_masses"]
-    classical_masses_src = compute_classical_estimators(
-        stds_from_graphs[:src_size], hlrs_from_graphs[:src_size]
-    )
-    classical_rel = {
-        "Walker":   classical_masses_src["Walker"]   / estim_masses[:src_size, 0],
-        "Wolf":     classical_masses_src["Wolf"]     / estim_masses[:src_size, 1],
-        "Amorisco": classical_masses_src["Amorisco"] / estim_masses[:src_size, 2],
-        "Errani":   classical_masses_src["Errani"]   / estim_masses[:src_size, 3],
-        "Campbell": classical_masses_src["Campbell"] / estim_masses[:src_size, 4],
-    }
+    if args.mask_missing == "drop":
+        graphs_src, hlrs_from_graphs_src, stds_from_graphs_src = filter_fully_resolved(
+            graphs_src,
+            hlrs_from_graphs[:src_size],
+            stds_from_graphs[:src_size],
+        )
+        # Rebuild aligned file_indices after filtering
+        keep_mask       = np.array([g.mask.min().item() == 1.0
+                                    for g in graphs_all[:src_size]])
+        file_indices_src = raw["file_indices"][:src_size][keep_mask]
+        labels_src       = labels_src[keep_mask]
+        masks_src_arr    = raw["masks"][:src_size][keep_mask]
+    else:
+        hlrs_from_graphs_src = hlrs_from_graphs[:src_size]
+        stds_from_graphs_src = stds_from_graphs[:src_size]
+        file_indices_src     = raw["file_indices"][:src_size]
+        masks_src_arr        = raw["masks"][:src_size]
 
-    file_indices_src                                     = raw["file_indices"][:src_size]
     src_train_graphs, src_val_graphs, train_mask, val_mask = train_val_split(
         graphs_src, file_indices_src
     )
 
-    # ── Standardization ───────────────────────────────────────────────────────
-    # Computed from source training graphs only to avoid data leakage.
-    # When mask_missing is active, label statistics per dimension exclude
-    # samples where that dimension is unresolved.
-    x_mean, x_std, y_mean, y_std, hlr_mean, hlr_std, s_mean, s_std = compute_standardization_stats(
-    src_train_graphs, args.mask_missing
-    )
+    x_mean, x_std, y_mean, y_std, hlr_mean, hlr_std, s_mean, s_std = \
+        compute_standardization_stats(src_train_graphs, args.mask_missing)
     print(
         f"Input  standardization — mean: {x_mean.numpy().round(4)}  "
         f"std: {x_std.numpy().round(4)}"
@@ -1138,99 +1367,220 @@ def main() -> None:
         f"std: {y_std.numpy().round(4)}"
     )
 
+    # ── Classical estimators ──────────────────────────────────────────────────
+    classical_masses_src = compute_classical_estimators(
+        stds_from_graphs_src, hlrs_from_graphs_src
+    )
+    estim_masses = raw["estimator_masses"]
+
+    # classical_rel uses only src projections (pre-drop filter aligns indices)
+    src_proj_count = len(graphs_src)
+    classical_rel = {
+        "Walker":   classical_masses_src["Walker"]   / estim_masses[:src_size, 0][:src_proj_count],
+        "Wolf":     classical_masses_src["Wolf"]     / estim_masses[:src_size, 1][:src_proj_count],
+        "Amorisco": classical_masses_src["Amorisco"] / estim_masses[:src_size, 2][:src_proj_count],
+        "Errani":   classical_masses_src["Errani"]   / estim_masses[:src_size, 3][:src_proj_count],
+        "Campbell": classical_masses_src["Campbell"] / estim_masses[:src_size, 4][:src_proj_count],
+    }
+
+    return dict(
+        # keys / indices
+        src_key              = src_key,
+        tgt_key              = tgt_key,
+        src_indices          = src_indices,
+        tgt_indices          = tgt_indices,
+        nstars_arr           = nstars_arr,
+        label_mass_radii_frac= label_mass_radii_frac,
+        # graph lists
+        src_train_graphs     = src_train_graphs,
+        src_val_graphs       = src_val_graphs,
+        graphs_tgt_all       = graphs_tgt_all,
+        graphs_test          = graphs_test,
+        # labels / masks
+        labels_src           = labels_src,
+        labels_tgt_filtered  = labels_tgt_filtered,
+        masks_src_arr        = masks_src_arr,
+        train_mask           = train_mask,
+        val_mask             = val_mask,
+        mask_test            = mask_test,
+        # standardization tensors
+        x_mean=x_mean, x_std=x_std,
+        y_mean=y_mean, y_std=y_std,
+        hlr_mean=hlr_mean, hlr_std=hlr_std,
+        s_mean=s_mean, s_std=s_std,
+        # diagnostics
+        hlrs_from_graphs     = hlrs_from_graphs,
+        stds_from_graphs     = stds_from_graphs,
+        classical_rel        = classical_rel,
+        estim_masses         = estim_masses,
+        raw                  = raw,
+        n_labels             = len(label_mass_radii_frac),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build_model  — construct posterior and register standardization buffers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_model(args, data):
+    """Construct embedding, flow, and posterior from CLI args and data stats.
+
+    Returns the posterior (compiled) ready for training or loading.
+    """
+    use_dann     = args.dann_source is not None
+    use_mmd      = use_dann and args.da_method == "mmd"
+    use_dann_adv = use_dann and args.da_method == "dann"
+    use_hlr_std  = bool(args.hlr_std)
+    n_labels     = data["n_labels"]
+
     layer_cfg = GRAPH_LAYER_CONFIGS[args.GraphNN_type]
     embedding = GraphNN(
         in_channels           = 2,
-        out_channels          = 128,
-        hidden_graph_channels = 128,
-        num_graph_layers      = 3,
-        hidden_fc_channels    = 128,
-        num_fc_layers         = 2,
-        dropout               = 0.1
+        out_channels          = args.hidden_dim,
+        hidden_graph_channels = args.hidden_dim,
+        num_graph_layers      = args.num_graph_layers,
+        hidden_fc_channels    = args.hidden_dim,
+        num_fc_layers         = args.num_fc_layers,
+        dropout               = args.dropout,
         hlr_std               = use_hlr_std,
+        use_residuals         = bool(args.use_residuals),
+        use_batch_norm        = bool(args.use_batch_norm),
         **layer_cfg,
     )
 
-    context_dim = 128
+    # "mask" mode appends the resolution mask vector to the context
+    context_dim = args.hidden_dim
     if args.mask_missing == "mask":
         context_dim += n_labels
 
     flow = build_maf_flow(
         features         = n_labels,
         context_features = context_dim,
-        hidden_features  = 128,
+        hidden_features  = args.hidden_dim,
         num_transforms   = 4,
     )
-    
-    use_mmd  = use_dann and args.da_method == "mmd"
-    use_dann_adv = use_dann and args.da_method == "dann"
 
     if use_dann_adv:
         domain_cls = DomainClassifier(
-            in_features     = 128,
+            in_features     = args.hidden_dim,
             hidden_features = args.dann_domain_hidden,
             lambda_         = 0.0,
         )
         posterior: DANNFlowPosterior | MMDFlowPosterior | FlowPosterior = DANNFlowPosterior(
-            embedding_net     = embedding,
-            flow              = flow,
-            domain_classifier = domain_cls,
-            mask_missing      = args.mask_missing,
+            embedding_net      = embedding,
+            flow               = flow,
+            domain_classifier  = domain_cls,
+            mask_missing       = args.mask_missing,
         )
     elif use_mmd:
         posterior = MMDFlowPosterior(
-            embedding_net  = embedding,
-            flow           = flow,
-            mmd_lambda     = args.mmd_lambda,
-            mask_missing   = args.mask_missing,
+            embedding_net = embedding,
+            flow          = flow,
+            mmd_lambda    = args.mmd_lambda,
+            mask_missing  = args.mask_missing,
         )
     else:
-        posterior = FlowPosterior(embedding_net=embedding, flow=flow, mask_missing=args.mask_missing)
+        posterior = FlowPosterior(
+            embedding_net = embedding,
+            flow          = flow,
+            mask_missing  = args.mask_missing,
+        )
 
-    # Register standardization buffers (moved with the model via .to(device) and pickle).
-    posterior.set_standardization(x_mean, x_std, y_mean, y_std, hlr_mean, hlr_std, s_mean, s_std)
+    posterior = torch.compile(posterior, dynamic=True)
+    posterior.set_standardization(
+        data["x_mean"], data["x_std"],
+        data["y_mean"], data["y_std"],
+        data["hlr_mean"], data["hlr_std"],
+        data["s_mean"], data["s_std"],
+    )
+    return posterior
 
-    posterior_path = os.path.join(model_folder, "posterior.pkl")
 
-    if args.mode == "train":
-        if use_dann_adv:
-            src_train_loader, src_val_loader, tgt_loader = make_dann_loaders(
-                src_train_graphs, src_val_graphs, graphs_tgt_all, batch_size=64
-            )
-            summary = train_dann_posterior(
-                posterior, src_train_loader, src_val_loader, tgt_loader, device,
-                learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
-                lambda_max=args.dann_lambda, gamma=args.dann_gamma,
-                lr_factor=0.5, lr_patience=5,
-            )
-        elif use_mmd:
-            src_train_loader, src_val_loader, tgt_loader = make_dann_loaders(
-                src_train_graphs, src_val_graphs, graphs_tgt_all, batch_size=64
-            )
-            summary = train_mmd_posterior(
-                posterior, src_train_loader, src_val_loader, tgt_loader, device,
-                learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
-                lr_factor=0.5, lr_patience=5,
-            )
-        else:
-            train_loader, val_loader = make_data_loaders(
-                src_train_graphs, src_val_graphs, batch_size=64
-            )
-            summary = train_posterior(
-                posterior, train_loader, val_loader, device,
-                learning_rate=4e-4, max_epochs=500, stop_after_epochs=10,
-                lr_factor=0.5, lr_patience=5,
-            )
+# ─────────────────────────────────────────────────────────────────────────────
+# run_training  — select training loop, train, save
+# ─────────────────────────────────────────────────────────────────────────────
 
-        plot_training_curves(summary, os.path.join(model_folder, "loss.png"))
-        with open(posterior_path, "wb") as f:
-            pickle.dump(posterior, f)
+def run_training(args, posterior, data, device, model_folder, mlflow_run=None):
+    """Run the appropriate training loop and save the model.
+
+    Returns the training summary dict.
+    """
+    use_dann     = args.dann_source is not None
+    use_mmd      = use_dann and args.da_method == "mmd"
+    use_dann_adv = use_dann and args.da_method == "dann"
+
+    src_train_graphs = data["src_train_graphs"]
+    src_val_graphs   = data["src_val_graphs"]
+    graphs_tgt_all   = data["graphs_tgt_all"]
+
+    if use_dann_adv:
+        src_train_loader, src_val_loader, tgt_loader = make_dann_loaders(
+            src_train_graphs, src_val_graphs, graphs_tgt_all,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+        )
+        summary = train_dann_posterior(
+            posterior, src_train_loader, src_val_loader, tgt_loader, device,
+            learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
+            lambda_max=args.dann_lambda, gamma=args.dann_gamma,
+            lr_factor=0.5, lr_patience=15,
+            mlflow_run=mlflow_run,
+        )
+    elif use_mmd:
+        src_train_loader, src_val_loader, tgt_loader = make_dann_loaders(
+            src_train_graphs, src_val_graphs, graphs_tgt_all,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+        )
+        summary = train_mmd_posterior(
+            posterior, src_train_loader, src_val_loader, tgt_loader, device,
+            learning_rate=4e-4, max_epochs=500, stop_after_epochs=20,
+            lambda_max=args.mmd_lambda, gamma=args.mmd_gamma,
+            lr_factor=0.5, lr_patience=15,
+            mlflow_run=mlflow_run,
+        )
     else:
-        with open(posterior_path, "rb") as f:
-            posterior = pickle.load(f)
+        train_loader, val_loader = make_data_loaders(
+            src_train_graphs, src_val_graphs,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+        )
+        summary = train_posterior(
+            posterior, train_loader, val_loader, device,
+            learning_rate=4e-4, max_epochs=500, stop_after_epochs=10,
+            lr_factor=0.5, lr_patience=15,
+            mlflow_run=mlflow_run,
+        )
 
+    plot_training_curves(summary, os.path.join(model_folder, "loss.png"))
+    with open(os.path.join(model_folder, "posterior.pkl"), "wb") as f:
+        pickle.dump(posterior, f)
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_evaluation  — sample, compute ratio stats, plot, save
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_evaluation(args, posterior, data, device, model_folder, seed, nstars_arr, mlflow_run=None):
+    """Sample the posterior on train/val/test sets, compute mass-ratio
+    statistics, produce plots, and save plot_data.pkl.
+    """
+    use_dann  = args.dann_source is not None
+    n_labels  = data["n_labels"]
     n_samples   = 1000
     timeout_sec = 5 * 60
+
+    src_train_graphs    = data["src_train_graphs"]
+    src_val_graphs      = data["src_val_graphs"]
+    graphs_test         = data["graphs_test"]
+    labels_src          = data["labels_src"]
+    labels_tgt_filtered = data["labels_tgt_filtered"]
+    train_mask          = data["train_mask"]
+    val_mask            = data["val_mask"]
+    mask_test           = data["mask_test"]
+    masks_src_arr       = data["masks_src_arr"]
+    src_key             = data["src_key"]
+    tgt_key             = data["tgt_key"]
+    classical_rel       = data["classical_rel"]
+    label_mass_radii_frac = data["label_mass_radii_frac"]
 
     samples_train_path = os.path.join(model_folder, "samples_train.npy")
     samples_val_path   = os.path.join(model_folder, "samples_val.npy")
@@ -1262,15 +1612,10 @@ def main() -> None:
     truths_val   = labels_src[val_mask]
     truths_test  = labels_tgt_filtered
 
-    # masks_src shape: (N_src_projections, n_labels), bool
-    masks_src  = raw["masks"][:src_size]
-    masks_train = masks_src[train_mask]   # aligned to truths_train / samples_train
-    masks_val   = masks_src[val_mask]     # aligned to truths_val   / samples_val
-
-    # For the test set: apply the same mask_test filter used for labels_tgt_filtered
-    masks_tgt_all      = raw["masks"][src_size:]
-    masks_test         = masks_tgt_all[mask_test]   # aligned to truths_test / samples_test
-
+    masks_train = masks_src_arr[train_mask]
+    masks_val   = masks_src_arr[val_mask]
+    masks_tgt_all = data["raw"]["masks"][len(labels_src):]
+    masks_test    = masks_tgt_all[mask_test]
 
     ratio_stats = {
         "Training":   compute_ratio_stats(samples_train, truths_train),
@@ -1278,7 +1623,7 @@ def main() -> None:
         "Testing":    compute_ratio_stats(samples_test,  truths_test),
     }
 
-    if args.mask_missing:
+    if args.mask_missing in ("mask", "BIF", "drop"):
         s_train_m, t_train_m = apply_resolution_mask(samples_train, truths_train, masks_train)
         s_val_m,   t_val_m   = apply_resolution_mask(samples_val,   truths_val,   masks_val)
         s_test_m,  t_test_m  = apply_resolution_mask(samples_test,  truths_test,  masks_test)
@@ -1297,6 +1642,10 @@ def main() -> None:
             print("  median:",   med)
             print("  p84-p16:", p84 - p16)
 
+    plot_title = (
+        f"DANN  src={src_key}  tgt={tgt_key}" if use_dann
+        else f"{src_key} -> {tgt_key}"
+    )
     plot_mass_ratios(
         label_mass_radii_frac, ratio_stats, classical_rel,
         sim       = plot_title,
@@ -1311,13 +1660,13 @@ def main() -> None:
             save_path = os.path.join(model_folder, "TrainingVsValidationVsTest_resolved.png"),
         )
 
-    def _ratio_stats_to_dict(rs):
+    def _rs_to_dict(rs):
         return {k: {"med": v[0], "p16": v[1], "p84": v[2]} for k, v in rs.items()}
 
     plot_data = dict(
-        label_mass_radii_frac  = label_mass_radii_frac,
-        ratio_stats            = _ratio_stats_to_dict(ratio_stats),
-        ratio_stats_resolved   = _ratio_stats_to_dict(ratio_stats_resolved),
+        label_mass_radii_frac = label_mass_radii_frac,
+        ratio_stats           = _rs_to_dict(ratio_stats),
+        ratio_stats_resolved  = _rs_to_dict(ratio_stats_resolved),
         train_set        = src_key,
         test_set         = tgt_key,
         dann             = use_dann,
@@ -1327,20 +1676,113 @@ def main() -> None:
         Nstars           = args.N_stars,
         actual_n         = nstars_arr,
         seed             = seed,
-        N_files_train    = len(src_indices),
-        N_files_test     = len(tgt_indices),
+        N_files_train    = len(data["src_indices"]),
+        N_files_test     = len(data["tgt_indices"]),
         N_proj_per_gal   = args.N_proj_per_gal,
-        hlrs             = hlrs_from_graphs.tolist(),
-        stds             = stds_from_graphs.tolist(),
-        estim_masses     = raw["estimator_masses"].tolist(),
-        classical_masses = classical_masses_src,
-        test_long        = test_long,
+        hlrs             = data["hlrs_from_graphs"].tolist(),
+        stds             = data["stds_from_graphs"].tolist(),
+        estim_masses     = data["estim_masses"].tolist(),
+        classical_masses = classical_rel,
+        test_long        = bool(args.test_long),
         model_folder     = model_folder,
     )
     plot_data_path = os.path.join(model_folder, "plot_data.pkl")
     with open(plot_data_path, "wb") as f:
         pickle.dump(plot_data, f)
     print(f"Plot data saved to {plot_data_path}")
+
+    mlflow_log_results(ratio_stats, ratio_stats_resolved)
+    mlflow_log_artefacts(model_folder, args)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# main  — orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args       = parse_args()
+    use_dann   = args.dann_source is not None
+    pca_filter = bool(args.PCAfilter)
+
+    accelerator = Accelerator()
+    device      = accelerator.device
+
+    seed = 22133
+    np.random.seed(seed)
+
+    pca_suffix    = "PCAfilt" if pca_filter else "PCAnofilt"
+    data_folder   = (
+        f"/net/debut/project/jsarrato/Paper-GraphSimProfiles/work/"
+        f"arrs_NIHAO_and_AURIGA_{pca_suffix}_1000/"
+    )
+    main_work_dir = "/net/deimos/scratch/jsarrato/Wolf_for_FIRE/work/"
+
+    label_file = load_label_file(data_folder, pca_filter)
+
+    data = build_data(args, label_file, data_folder, seed)
+
+    src_key  = data["src_key"]
+    tgt_key  = data["tgt_key"]
+    dann_tag = f"_DANN-src{src_key}" if use_dann else ""
+    mask_tag = f"_mask-{args.mask_missing}" if args.mask_missing else ""
+    if use_dann:
+        if args.da_method == "mmd":
+            da_tag = f"_mmd-lam{args.mmd_lambda}-gam{args.mmd_gamma}"
+        else:
+            da_tag = f"_dann-lam{args.dann_lambda}-gam{args.dann_gamma}"
+    else:
+        da_tag = ""
+    model_str = (
+        f"{args.GraphNN_type}"
+        f"_src{src_key}_tgt{tgt_key}{dann_tag}{da_tag}{mask_tag}"
+        f"_h{args.hidden_dim}_gl{args.num_graph_layers}_fc{args.num_fc_layers}"
+        f"_res{args.use_residuals}_bn{args.use_batch_norm}_do{args.dropout}"
+        f"_poisson{args.N_stars}_Nfiles{len(data['src_indices'])}"
+        f"_Nproj{args.N_proj_per_gal}_hlrstd{args.hlr_std}"
+    )
+    model_folder = os.path.join(main_work_dir, "Graph+Flow_Mocks_NH/new/", model_str)
+    os.makedirs(model_folder, exist_ok=True)
+
+    plot_label_distributions(
+        np.array(data["raw"]["labels"])[:data["raw"]["train_and_val_size"]],
+        np.array(data["raw"]["labels"])[data["raw"]["train_and_val_size"]:],
+        data["labels_tgt_filtered"],
+        model_folder,
+    )
+
+    import json as _json
+    with open(os.path.join(model_folder, "graphs_train.pkl"), "wb") as _f:
+        pickle.dump(data["src_train_graphs"], _f)
+    with open(os.path.join(model_folder, "graphs_val.pkl"), "wb") as _f:
+        pickle.dump(data["src_val_graphs"], _f)
+    _std = dict(
+        x_mean   = data["x_mean"].tolist(),   x_std    = data["x_std"].tolist(),
+        y_mean   = data["y_mean"].tolist(),   y_std    = data["y_std"].tolist(),
+        hlr_mean = float(data["hlr_mean"]),   hlr_std  = float(data["hlr_std"]),
+        s_mean   = float(data["s_mean"]),     s_std    = float(data["s_std"]),
+    )
+    with open(os.path.join(model_folder, "std_stats.json"), "w") as _f:
+        _json.dump(_std, _f)
+
+    posterior      = build_model(args, data)
+    posterior_path = os.path.join(model_folder, "posterior.pkl")
+
+    with setup_mlflow(args, model_str) as mlflow_run:
+        mlflow_log_hparams(args, data)
+        mlflow.log_param("model_folder", model_folder)
+
+        if args.mode == "train":
+            run_training(args, posterior, data, device, model_folder,
+                         mlflow_run=mlflow_run)
+        else:
+            with open(posterior_path, "rb") as f:
+                posterior = pickle.load(f)
+
+        run_evaluation(
+            args, posterior, data, device, model_folder,
+            seed=seed, nstars_arr=data["nstars_arr"],
+            mlflow_run=mlflow_run,
+        )
 
 
 if __name__ == "__main__":
